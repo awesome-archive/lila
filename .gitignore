@@ -1,22 +1,42 @@
+.sbtopts
+.bsp
+.bloop/
+.metals/
+project/.bloop/
 conf/application.conf
-bin/dev
+conf/version.conf
+
 logs
+project/metals.sbt
 project/project
 project/target
-public/trans
 public/compiled
+public/vendor/bar-rating
+public/vendor/highcharts-4.2.5
+public/vendor/hopscotch
+public/vendor/tagify
 public/vendor/stockfish.wasm
+public/vendor/stockfish-nnue.wasm
 public/vendor/stockfish-mv.wasm
-public/vendor/stockfish.pexe
 public/vendor/stockfish.js
+public/css/
 target
-bin/.translate_version
 data/
 dist/
 node_modules/
 local/
+ui/common/**/*.js
+ui/common/**/*.d.ts
+ui/game/**/*.js
+ui/game/**/*.d.ts
+ui/nvui/**/*.js
+ui/nvui/**/*.d.ts
+ui/puz/**/*.js
+ui/puz/**/*.d.ts
 ui/*/npm-debug.log
+ui/*/tsconfig.tsbuildinfo
 hs_*.log
+yarn-error.log
 
 RUNNING_PID
 
@@ -24,3 +44,6 @@ RUNNING_PID
 /modules/*/.classpath
 /modules/*/.project
 /modules/*/.settings/
+
+# VSCode auto-generated files
+.vscode/

@@ -1,22 +1,20 @@
-import { h } from 'snabbdom'
-import { VNode } from 'snabbdom/vnode'
-import { Chessground } from 'chessground';
+import { h, VNode } from 'snabbdom';
 import { opposite } from 'chessground/util';
-import { StudyCtrl, ChapterPreview, ChapterPreviewPlayer } from './interfaces';
+import { StudyCtrl, ChapterPreview, ChapterPreviewPlayer, Position } from './interfaces';
 import { MaybeVNodes } from '../interfaces';
 import { multiBoard as xhrLoad } from './studyXhr';
 import { bind, spinner } from '../util';
+import * as domData from 'common/data';
 
 export class MultiBoardCtrl {
-
-  loading: boolean = false;
-  page: number = 1;
+  loading = false;
+  page = 1;
   pager?: Paginator<ChapterPreview>;
-  playing: boolean = false;
+  playing = false;
 
-  constructor(readonly studyId: string, readonly redraw: () => void) {}
+  constructor(readonly studyId: string, readonly redraw: () => void, readonly trans: Trans) {}
 
-  addNode(pos, node) {
+  addNode(pos: Position, node: Tree.Node) {
     const cp = this.pager && this.pager.currentPageResults.find(cp => cp.id == pos.chapterId);
     if (cp && cp.playing) {
       cp.fen = node.fen;
@@ -49,7 +47,9 @@ export class MultiBoardCtrl {
   };
   nextPage = () => this.setPage(this.page + 1);
   prevPage = () => this.setPage(this.page - 1);
-  lastPage = () => { if (this.pager) this.setPage(this.pager.nbPages); };
+  lastPage = () => {
+    if (this.pager) this.setPage(this.pager.nbPages);
+  };
 
   setPlaying = (v: boolean) => {
     this.playing = v;
@@ -58,118 +58,117 @@ export class MultiBoardCtrl {
 }
 
 export function view(ctrl: MultiBoardCtrl, study: StudyCtrl): VNode | undefined {
-
-  return h('div.multi_board', {
-    class: { loading: ctrl.loading },
-    hook: {
-      insert() { ctrl.reload(true); }
-    }
-  }, ctrl.pager ? renderPager(ctrl.pager, study) : [spinner()]);
+  return h(
+    'div.study__multiboard',
+    {
+      class: { loading: ctrl.loading, nopager: !ctrl.pager },
+      hook: {
+        insert() {
+          ctrl.reload(true);
+        },
+      },
+    },
+    ctrl.pager ? renderPager(ctrl.pager, study) : [spinner()]
+  );
 }
 
 function renderPager(pager: Paginator<ChapterPreview>, study: StudyCtrl): MaybeVNodes {
   const ctrl = study.multiBoard;
   return [
-    h('div.top', [
-      renderPagerNav(pager, ctrl),
-      renderPlayingToggle(ctrl)
-    ]),
-    h('div#now_playing', pager.currentPageResults.map(makePreview(study)))
+    h('div.top', [renderPagerNav(pager, ctrl), renderPlayingToggle(ctrl)]),
+    h('div.now-playing', pager.currentPageResults.map(makePreview(study))),
   ];
 }
 
 function renderPlayingToggle(ctrl: MultiBoardCtrl): VNode {
-  return h('label.playing', {
-    attrs: { title: 'Only ongoing games' }
-  }, [
+  return h('label.playing', [
     h('input', {
       attrs: { type: 'checkbox' },
       hook: bind('change', e => {
         ctrl.setPlaying((e.target as HTMLInputElement).checked);
-      })
+      }),
     }),
-    'Playing'
+    ctrl.trans.noarg('playing'),
   ]);
 }
 
 function renderPagerNav(pager: Paginator<ChapterPreview>, ctrl: MultiBoardCtrl): VNode {
   const page = ctrl.page,
-  from = Math.min(pager.nbResults, (page - 1) * pager.maxPerPage + 1),
-  to = Math.min(pager.nbResults, page * pager.maxPerPage);
+    from = Math.min(pager.nbResults, (page - 1) * pager.maxPerPage + 1),
+    to = Math.min(pager.nbResults, page * pager.maxPerPage);
   return h('div.pager', [
-    pagerButton('First', 'W', () => ctrl.setPage(1), page > 1, ctrl),
-    pagerButton('Prev', 'Y', ctrl.prevPage, page > 1, ctrl),
+    pagerButton(ctrl.trans.noarg('first'), 'W', () => ctrl.setPage(1), page > 1, ctrl),
+    pagerButton(ctrl.trans.noarg('previous'), 'Y', ctrl.prevPage, page > 1, ctrl),
     h('span.page', `${from}-${to} / ${pager.nbResults}`),
-    pagerButton('Next', 'X', ctrl.nextPage, page < pager.nbPages, ctrl),
-    pagerButton('Last', 'V', ctrl.lastPage, page < pager.nbPages, ctrl)
+    pagerButton(ctrl.trans.noarg('next'), 'X', ctrl.nextPage, page < pager.nbPages, ctrl),
+    pagerButton(ctrl.trans.noarg('last'), 'V', ctrl.lastPage, page < pager.nbPages, ctrl),
   ]);
 }
 
 function pagerButton(text: string, icon: string, click: () => void, enable: boolean, ctrl: MultiBoardCtrl): VNode {
-  return h('button.fbt.is', {
+  return h('button.fbt', {
     attrs: {
       'data-icon': icon,
       disabled: !enable,
-      title: text
+      title: text,
     },
-    hook: bind('mousedown', click, ctrl.redraw)
+    hook: bind('mousedown', click, ctrl.redraw),
   });
 }
 
 function makePreview(study: StudyCtrl) {
   return (preview: ChapterPreview) => {
-    const contents = preview.players ? [
-      makePlayer(preview.players[opposite(preview.orientation)]),
-      makeCg(preview),
-      makePlayer(preview.players[preview.orientation])
-    ] : [
-      h('div.name', preview.name),
-      makeCg(preview)
-    ];
-    return h('a.mini_board.' + preview.id, {
-      attrs: { title: preview.name },
-      class: { active: !study.multiBoard.loading && study.vm.chapterId == preview.id },
-      hook: bind('mousedown', _ => study.setChapter(preview.id))
-    }, contents);
+    const contents = preview.players
+      ? [
+          makePlayer(preview.players[opposite(preview.orientation)]),
+          makeCg(preview),
+          makePlayer(preview.players[preview.orientation]),
+        ]
+      : [h('div.name', preview.name), makeCg(preview)];
+    return h(
+      'a.' + preview.id,
+      {
+        attrs: { title: preview.name },
+        class: {
+          active:
+            !study.multiBoard.loading &&
+            study.vm.chapterId == preview.id &&
+            (!study.relay || !study.relay.intro.active),
+        },
+        hook: bind('mousedown', _ => study.setChapter(preview.id)),
+      },
+      contents
+    );
   };
 }
 
 function makePlayer(player: ChapterPreviewPlayer): VNode {
-  return h('div.player', [
+  return h('span.player', [
     player.title ? `${player.title} ${player.name}` : player.name,
-    player.rating && h('span', '' + player.rating)
+    player.rating && h('span', '' + player.rating),
   ]);
 }
 
-function uciToLastMove(lm?: string): Key[] | undefined {
-  return lm ? ([lm[0] + lm[1], lm[2] + lm[3]] as Key[]) : undefined;
-}
-
 function makeCg(preview: ChapterPreview): VNode {
-  return h('div.cg-board-wrap', {
+  return h('span.mini-board.cg-wrap.is2d', {
+    attrs: {
+      'data-state': `${preview.fen},${preview.orientation},${preview.lastMove}`,
+    },
     hook: {
       insert(vnode) {
-        const cg = Chessground(vnode.elm as HTMLElement, {
-          coordinates: false,
-          drawable: { enabled: false, visible: false },
-          resizable: false,
-          viewOnly: true,
-          orientation: preview.orientation,
-          fen: preview.fen,
-          lastMove: uciToLastMove(preview.lastMove)
-        });
-        vnode.data!.cp = { cg, fen: preview.fen };
+        lichess.miniBoard.init(vnode.elm as HTMLElement);
+        vnode.data!.fen = preview.fen;
       },
       postpatch(old, vnode) {
-        if (old.data!.cp.fen !== preview.fen) {
-          old.data!.cp.cg.set({
+        if (old.data!.fen !== preview.fen) {
+          const lm = preview.lastMove!;
+          domData.get(vnode.elm as HTMLElement, 'chessground').set({
             fen: preview.fen,
-            lastMove: uciToLastMove(preview.lastMove)
+            lastMove: [lm[0] + lm[1], lm[2] + lm[3]],
           });
-          old.data!.cp.fen = preview.fen;
         }
-        vnode.data!.cp = old.data!.cp;
-      }
-    }
-  }, [h('div.cg-board')])
+        vnode.data!.fen = preview.fen;
+      },
+    },
+  });
 }

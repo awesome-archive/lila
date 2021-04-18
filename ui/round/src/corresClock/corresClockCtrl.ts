@@ -13,8 +13,8 @@ export interface CorresClockController {
   root: RoundController;
   data: CorresClockData;
   timePercent(color: Color): number;
-  update(white: Seconds, black: Seconds): void
-  tick(color: Color): void
+  update(white: Seconds, black: Seconds): void;
+  tick(color: Color): void;
   millisOf(color: Color): Millis;
 }
 
@@ -25,12 +25,9 @@ interface Times {
 }
 
 export function ctrl(root: RoundController, data: CorresClockData, onFlag: () => void): CorresClockController {
-
   const timePercentDivisor = 0.1 / data.increment;
 
-  function timePercent(color: Color): number {
-    return Math.max(0, Math.min(100, times[color] * timePercentDivisor));
-  }
+  const timePercent = (color: Color): number => Math.max(0, Math.min(100, times[color] * timePercentDivisor));
 
   let times: Times;
 
@@ -38,21 +35,19 @@ export function ctrl(root: RoundController, data: CorresClockData, onFlag: () =>
     times = {
       white: white * 1000,
       black: black * 1000,
-      lastUpdate: Date.now()
+      lastUpdate: performance.now(),
     };
-  };
+  }
   update(data.white, data.black);
 
   function tick(color: Color): void {
-    const now = Date.now();
+    const now = performance.now();
     times[color] -= now - times.lastUpdate;
     times.lastUpdate = now;
     if (times[color] <= 0) onFlag();
   }
 
-  function millisOf(color: Color): Millis {
-    return Math.max(0, times[color]);
-  }
+  const millisOf = (color: Color): Millis => Math.max(0, times[color]);
 
   return {
     root,
@@ -60,6 +55,6 @@ export function ctrl(root: RoundController, data: CorresClockData, onFlag: () =>
     timePercent,
     millisOf,
     update,
-    tick
+    tick,
   };
 }

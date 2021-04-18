@@ -1,120 +1,183 @@
 package lila.puzzle
 
+import cats.implicits._
+import org.joda.time.DateTime
 import scala.concurrent.duration._
 
-import play.api.libs.json.JsValue
-
+import lila.common.paginator.Paginator
+import lila.common.config.MaxPerPage
 import lila.db.dsl._
+import lila.db.paginator.Adapter
 import lila.user.User
-import Puzzle.{ BSONFields => F }
 
-private[puzzle] final class PuzzleApi(
-    puzzleColl: Coll,
-    roundColl: Coll,
-    voteColl: Coll,
-    headColl: Coll,
-    puzzleIdMin: PuzzleId,
-    asyncCache: lila.memo.AsyncCache.Builder,
-    apiToken: String
-) {
+final class PuzzleApi(
+    colls: PuzzleColls,
+    trustApi: PuzzleTrustApi,
+    countApi: PuzzleCountApi
+)(implicit ec: scala.concurrent.ExecutionContext, system: akka.actor.ActorSystem, mode: play.api.Mode) {
 
-  import Puzzle.puzzleBSONHandler
+  import Puzzle.{ BSONFields => F }
+  import BsonHandlers._
 
   object puzzle {
 
-    def find(id: PuzzleId): Fu[Option[Puzzle]] =
-      puzzleColl.find($doc(F.id -> id)).uno[Puzzle]
+    def find(id: Puzzle.Id): Fu[Option[Puzzle]] =
+      colls.puzzle(_.byId[Puzzle](id.value))
 
-    def findMany(ids: List[PuzzleId]): Fu[List[Option[Puzzle]]] =
-      puzzleColl.optionsByOrderedIds[Puzzle, PuzzleId](ids)(_.id)
+    def delete(id: Puzzle.Id): Funit =
+      colls.puzzle(_.delete.one($id(id.value))).void
 
-    def latest(nb: Int): Fu[List[Puzzle]] =
-      puzzleColl.find($empty)
-        .sort($doc(F.date -> -1))
-        .cursor[Puzzle]()
-        .gather[List](nb)
-
-    val cachedLastId = asyncCache.single(
-      name = "puzzle.lastId",
-      f = lila.db.Util findNextId puzzleColl map (_ - 1),
-      expireAfter = _.ExpireAfterWrite(1 day)
-    )
-
-    def export(nb: Int): Fu[List[Puzzle]] = List(true, false).map { mate =>
-      puzzleColl.find($doc(F.mate -> mate))
-        .sort($doc(F.voteRatio -> -1))
-        .cursor[Puzzle]().gather[List](nb / 2)
-    }.sequenceFu.map(_.flatten)
-
-    def disable(id: PuzzleId): Funit =
-      puzzleColl.update(
-        $id(id),
-        $doc("$set" -> $doc(F.vote -> AggregateVote.disable))
-      ).void
+    def of(user: User, page: Int): Fu[Paginator[Puzzle]] =
+      colls.puzzle { coll =>
+        Paginator(
+          adapter = new Adapter[Puzzle](
+            collection = coll,
+            selector = $doc("users" -> user.id),
+            projection = none,
+            sort = $sort desc "glicko.r"
+          ),
+          page,
+          MaxPerPage(30)
+        )
+      }
   }
 
   object round {
 
-    def add(a: Round) = roundColl insert a
+    def find(user: User, puzzleId: Puzzle.Id): Fu[Option[PuzzleRound]] =
+      colls.round(_.byId[PuzzleRound](PuzzleRound.Id(user.id, puzzleId).toString))
 
-    def upsert(a: Round) = roundColl.update($id(a.id), a, upsert = true)
+    def exists(user: User, puzzleId: Puzzle.Id): Fu[Boolean] =
+      colls.round(_.exists($id(PuzzleRound.Id(user.id, puzzleId).toString)))
 
-    def reset(user: User) = roundColl.remove($doc(
-      Round.BSONFields.id $startsWith s"${user.id}:"
-    ))
+    def upsert(r: PuzzleRound, theme: PuzzleTheme.Key): Funit = {
+      val roundDoc = RoundHandler.write(r) ++
+        $doc(
+          PuzzleRound.BSONFields.user  -> r.id.userId,
+          PuzzleRound.BSONFields.theme -> theme.some.filter(_ != PuzzleTheme.mix.key)
+        )
+      colls.round(_.update.one($id(r.id), roundDoc, upsert = true)).void
+    }
   }
 
   object vote {
 
-    def value(id: PuzzleId, user: User): Fu[Option[Boolean]] =
-      voteColl.primitiveOne[Boolean]($id(Vote.makeId(id, user.id)), "v")
+    private val sequencer =
+      new lila.hub.DuctSequencers(
+        maxSize = 16,
+        expiration = 5 minutes,
+        timeout = 3 seconds,
+        name = "puzzle.vote"
+      )
 
-    def find(id: PuzzleId, user: User): Fu[Option[Vote]] = voteColl.byId[Vote](Vote.makeId(id, user.id))
-
-    def update(id: PuzzleId, user: User, v1: Option[Vote], v: Boolean): Fu[(Puzzle, Vote)] = puzzle find id flatMap {
-      case None => fufail(s"Can't vote for non existing puzzle ${id}")
-      case Some(p1) =>
-        val (p2, v2) = v1 match {
-          case Some(from) => (
-            (p1 withVote (_.change(from.value, v))),
-            from.copy(v = v)
-          )
-          case None => (
-            (p1 withVote (_ add v)),
-            Vote(Vote.makeId(id, user.id), v)
-          )
-        }
-        voteColl.update(
-          $id(v2.id),
-          $set("v" -> v),
-          upsert = true
-        ) zip
-          puzzleColl.update(
-            $id(p2.id),
-            $set(F.vote -> p2.vote)
-          ) map {
-              case _ => p2 -> v2
+    def update(id: Puzzle.Id, user: User, vote: Boolean): Funit =
+      sequencer(id.value) {
+        round
+          .find(user, id)
+          .flatMap {
+            _ ?? { prevRound =>
+              trustApi.vote(user, prevRound, vote) flatMap {
+                _ ?? { weight =>
+                  val voteValue = (if (vote) 1 else -1) * weight
+                  lila.mon.puzzle.vote(vote, prevRound.win).increment()
+                  updatePuzzle(id, voteValue, prevRound.vote) zip
+                    colls.round {
+                      _.updateField($id(prevRound.id), PuzzleRound.BSONFields.vote, voteValue)
+                    } void
+                }
+              }
             }
-    }
+          }
+      }
+
+    private def updatePuzzle(puzzleId: Puzzle.Id, newVote: Int, prevVote: Option[Int]): Funit =
+      colls.puzzle { coll =>
+        import Puzzle.{ BSONFields => F }
+        coll.one[Bdoc](
+          $id(puzzleId.value),
+          $doc(F.voteUp -> true, F.voteDown -> true, F.day -> true, F.id -> false)
+        ) flatMap {
+          _ ?? { doc =>
+            val prevUp   = ~doc.int(F.voteUp)
+            val prevDown = ~doc.int(F.voteDown)
+            val up       = prevUp + ~newVote.some.filter(0 <) - ~prevVote.filter(0 <)
+            val down     = prevDown - ~newVote.some.filter(0 >) + ~prevVote.filter(0 >)
+            coll.update
+              .one(
+                $id(puzzleId.value),
+                $set(
+                  F.voteUp   -> up,
+                  F.voteDown -> down,
+                  F.vote     -> ((up - down).toFloat / (up + down))
+                ) ++ {
+                  (newVote <= -100 && doc
+                    .getAsOpt[DateTime](F.day)
+                    .exists(_ isAfter DateTime.now.minusDays(1))) ??
+                    $unset(F.day)
+                }
+              )
+              .void
+          }
+        }
+      }
   }
 
-  object head {
+  object theme {
 
-    def find(user: User): Fu[Option[PuzzleHead]] = headColl.byId[PuzzleHead](user.id)
-
-    def set(h: PuzzleHead) = headColl.update($id(h.id), h, upsert = true) void
-
-    def addNew(user: User, puzzleId: PuzzleId) = set(PuzzleHead(user.id, puzzleId.some, puzzleId))
-
-    def currentPuzzleId(user: User): Fu[Option[PuzzleId]] =
-      find(user) map2 { (h: PuzzleHead) =>
-        h.current | h.last
+    def categorizedWithCount: Fu[List[(lila.i18n.I18nKey, List[PuzzleTheme.WithCount])]] =
+      countApi.countsByTheme map { counts =>
+        PuzzleTheme.categorized.map { case (cat, puzzles) =>
+          cat -> puzzles.map { pt =>
+            PuzzleTheme.WithCount(pt, counts.getOrElse(pt.key, 0))
+          }
+        }
       }
 
-    private[puzzle] def solved(user: User, id: PuzzleId): Funit = head find user flatMap { headOption =>
-      set {
-        PuzzleHead(user.id, none, headOption.fold(id)(head => id atLeast head.last))
+    def vote(user: User, id: Puzzle.Id, theme: PuzzleTheme.Key, vote: Option[Boolean]): Funit =
+      round.find(user, id) flatMap {
+        _ ?? { round =>
+          round.themeVote(theme, vote) ?? { newThemes =>
+            import PuzzleRound.{ BSONFields => F }
+            val update =
+              if (newThemes.isEmpty || !PuzzleRound.themesLookSane(newThemes))
+                fuccess($unset(F.themes, F.puzzle).some)
+              else
+                vote match {
+                  case None =>
+                    fuccess(
+                      $set(
+                        F.themes -> newThemes
+                      ).some
+                    )
+                  case Some(v) =>
+                    trustApi.theme(user, round, theme, v) map2 { weight =>
+                      $set(
+                        F.themes -> newThemes,
+                        F.puzzle -> id,
+                        F.weight -> weight
+                      )
+                    }
+                }
+            update flatMap {
+              _ ?? { up =>
+                lila.mon.puzzle.voteTheme(theme.value, vote, round.win).increment()
+                colls.round(_.update.one($id(round.id), up)) zip
+                  colls.puzzle(_.updateField($id(round.id.puzzleId), Puzzle.BSONFields.dirty, true)) void
+              }
+            }
+          }
+        }
       }
-    }
+  }
+
+  object casual {
+
+    private val store = new lila.memo.ExpireSetMemo(30 minutes)
+
+    private def key(user: User, id: Puzzle.Id) = s"${user.id}:${id}"
+
+    def set(user: User, id: Puzzle.Id) = store.put(key(user, id))
+
+    def apply(user: User, id: Puzzle.Id) = store.get(key(user, id))
   }
 }

@@ -1,29 +1,29 @@
 package lila.tournament
 
 import akka.actor._
+import akka.stream.scaladsl._
 import scala.concurrent.duration._
-import scala.concurrent.Promise
+import lila.common.ThreadLocalRandom
 
-import actorApi._
-import makeTimeout.short
-
-private final class StartedOrganizer(
+final private class StartedOrganizer(
     api: TournamentApi,
-    reminder: TournamentReminder,
-    isOnline: String => Boolean,
-    socketMap: SocketMap
-) extends Actor {
+    tournamentRepo: TournamentRepo,
+    playerRepo: PlayerRepo,
+    socket: TournamentSocket
+)(implicit mat: akka.stream.Materializer)
+    extends Actor {
 
-  override def preStart: Unit = {
-    pairingLogger.info("Start StartedOrganizer")
-    context setReceiveTimeout 15.seconds
-    scheduleNext
+  override def preStart(): Unit = {
+    context setReceiveTimeout 120.seconds
+    scheduleNext()
   }
+
+  implicit def ec = context.dispatcher
 
   case object Tick
 
-  def scheduleNext =
-    context.system.scheduler.scheduleOnce(3 seconds, self, Tick)
+  def scheduleNext(): Unit =
+    context.system.scheduler.scheduleOnce(2 seconds, self, Tick).unit
 
   def receive = {
 
@@ -33,35 +33,42 @@ private final class StartedOrganizer(
       throw new RuntimeException(msg)
 
     case Tick =>
-      val startAt = nowMillis
-      TournamentRepo.startedTours.flatMap { started =>
-        lila.common.Future.traverseSequentially(started) { tour =>
-          PlayerRepo activeUserIds tour.id flatMap { activeUserIds =>
-            val nb = activeUserIds.size
-            val result: Funit =
-              if (tour.secondsToFinish <= 0) fuccess(api finish tour)
-              else if (!tour.isScheduled && nb < 2) fuccess(api finish tour)
-              else if (!tour.pairingsClosed) startPairing(tour, activeUserIds, startAt)
-              else funit
-            result >>- reminder(tour, activeUserIds) inject nb
+      tournamentRepo.startedCursor
+        .documentSource()
+        .mapAsyncUnordered(4) { tour =>
+          processTour(tour) recover { case e: Exception =>
+            logger.error(s"StartedOrganizer $tour", e)
+            0
           }
-        }.addEffect { playerCounts =>
-          lila.mon.tournament.player(playerCounts.sum)
-          lila.mon.tournament.started(started.size)
         }
-      }.chronometer
-        .mon(_.tournament.startedOrganizer.tickTime)
-        .logIfSlow(500, logger)(_ => "StartedOrganizer.Tick")
-        .result addEffectAnyway scheduleNext
+        .toMat(Sink.fold(0 -> 0) { case ((tours, users), tourUsers) =>
+          (tours + 1, users + tourUsers)
+        })(Keep.right)
+        .run()
+        .addEffect { case (tours, users) =>
+          lila.mon.tournament.started.update(tours)
+          lila.mon.tournament.waitingPlayers.record(users).unit
+        }
+        .monSuccess(_.tournament.startedOrganizer.tick)
+        .addEffectAnyway(scheduleNext())
+        .unit
   }
 
-  private def startPairing(tour: Tournament, activeUserIds: List[String], startAt: Long): Funit =
-    getWaitingUsers(tour) zip PairingRepo.playingUserIds(tour) map {
-      case (waitingUsers, playingUserIds) =>
-        val users = waitingUsers intersect activeUserIds.toSet diff playingUserIds
-        api.makePairings(tour, users, startAt)
-    }
+  private def processTour(tour: Tournament): Fu[Int] =
+    if (tour.secondsToFinish <= 0) api finish tour inject 0
+    else if (!tour.isScheduled && tour.nbPlayers < 30 && ThreadLocalRandom.nextInt(10) == 0) {
+      playerRepo nbActiveUserIds tour.id flatMap { nb =>
+        (nb >= 2) ?? startPairing(tour)
+      }
+    } else startPairing(tour)
 
-  private def getWaitingUsers(tour: Tournament): Fu[WaitingUsers] =
-    socketMap.askIfPresent[WaitingUsers](tour.id)(GetWaitingUsersP) map (_ | WaitingUsers.empty)
+  // returns number of users actively awaiting a pairing
+  private def startPairing(tour: Tournament): Fu[Int] =
+    (!tour.pairingsClosed && tour.nbPlayers > 1) ??
+      socket
+        .getWaitingUsers(tour)
+        .monSuccess(_.tournament.startedOrganizer.waitingUsers)
+        .flatMap { waiting =>
+          api.makePairings(tour, waiting) inject waiting.size
+        }
 }

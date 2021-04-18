@@ -3,14 +3,17 @@ package paginator
 
 import dsl._
 import reactivemongo.api._
-import reactivemongo.bson._
+import reactivemongo.api.bson._
+import scala.concurrent.ExecutionContext
+import scala.util.chaining._
 
 import lila.common.paginator.AdapterLike
 
 final class CachedAdapter[A](
     adapter: AdapterLike[A],
     val nbResults: Fu[Int]
-) extends AdapterLike[A] {
+)(implicit ec: ExecutionContext)
+    extends AdapterLike[A] {
 
   def slice(offset: Int, length: Int): Fu[Seq[A]] =
     adapter.slice(offset, length)
@@ -19,55 +22,33 @@ final class CachedAdapter[A](
 final class Adapter[A: BSONDocumentReader](
     collection: Coll,
     selector: Bdoc,
-    projection: Bdoc,
+    projection: Option[Bdoc],
     sort: Bdoc,
-    readPreference: ReadPreference = ReadPreference.primary
-) extends AdapterLike[A] {
+    readPreference: ReadPreference = ReadPreference.primary,
+    hint: Option[Bdoc] = None
+)(implicit ec: ExecutionContext)
+    extends AdapterLike[A] {
 
-  def nbResults: Fu[Int] = collection.countSel(selector, readPreference)
+  def nbResults: Fu[Int] = collection.secondaryPreferred.countSel(selector)
 
   def slice(offset: Int, length: Int): Fu[List[A]] =
-    collection.find(selector, projection)
+    collection
+      .find(selector, projection)
       .sort(sort)
       .skip(offset)
-      .list[A](length, readPreference)
+      .pipe { query =>
+        hint match {
+          case None    => query
+          case Some(h) => query.hint(collection hint h)
+        }
+      }
+      .cursor[A](readPreference)
+      .list(length)
 }
 
-/*
- * because mongodb mapReduce doesn't support `skip`, slice requires to queries.
- * The first one gets the IDs with `skip`.
- * The second one runs the mapReduce on these IDs.
- * This avoid running mapReduce on many unnecessary docs.
- * NOTE: Requires string ID.
- */
-final class MapReduceAdapter[A: BSONDocumentReader](
-    collection: Coll,
-    selector: Bdoc,
-    sort: Bdoc,
-    runCommand: RunCommand,
-    command: Bdoc,
-    readPreference: ReadPreference = ReadPreference.primary
-) extends AdapterLike[A] {
+final class StaticAdapter[A](results: Seq[A])(implicit ec: ExecutionContext) extends AdapterLike[A] {
 
-  def nbResults: Fu[Int] = collection.countSel(selector, readPreference)
+  def nbResults = fuccess(results.size)
 
-  def slice(offset: Int, length: Int): Fu[List[A]] =
-    collection.find(selector, $id(true))
-      .sort(sort)
-      .skip(offset)
-      .list[Bdoc](length, readPreference)
-      .dmap { _ flatMap { _.getAs[BSONString]("_id") } }
-      .flatMap { ids =>
-        runCommand(
-          $doc(
-            "mapreduce" -> collection.name,
-            "query" -> $inIds(ids),
-            "sort" -> sort,
-            "out" -> $doc("inline" -> true)
-          ) ++ command,
-          readPreference
-        ) map { res =>
-            res.getAs[List[Bdoc]]("results").??(_ map implicitly[BSONDocumentReader[A]].read)
-          }
-      }
+  def slice(offset: Int, length: Int) = fuccess(results drop offset take length)
 }

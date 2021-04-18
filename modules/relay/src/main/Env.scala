@@ -1,81 +1,63 @@
 package lila.relay
 
 import akka.actor._
-import com.typesafe.config.Config
+import com.softwaremill.macwire._
+import play.api.libs.ws.StandaloneWSClient
 import scala.concurrent.duration._
 
+import lila.common.config._
+
 final class Env(
-    config: Config,
-    db: lila.db.Env,
-    studyEnv: lila.study.Env,
-    asyncCache: lila.memo.AsyncCache.Builder,
-    slackApi: lila.slack.SlackApi,
+    ws: StandaloneWSClient,
+    db: lila.db.Db,
+    studyApi: lila.study.StudyApi,
+    chapterRepo: lila.study.ChapterRepo,
+    gameRepo: lila.game.GameRepo,
+    pgnDump: lila.game.PgnDump,
+    gameProxy: lila.round.GameProxyRepo,
+    cacheApi: lila.memo.CacheApi,
+    slackApi: lila.irc.SlackApi,
+    baseUrl: BaseUrl
+)(implicit
+    ec: scala.concurrent.ExecutionContext,
     system: ActorSystem
 ) {
 
-  private val MaxPerPage = config getInt "paginator.max_per_page"
+  private lazy val coll = db(CollName("relay"))
 
-  private val coll = db(config getString "collection.relay")
+  lazy val forms = wire[RelayForm]
 
-  lazy val forms = RelayForm
+  private lazy val repo = wire[RelayRepo]
 
-  private val repo = new RelayRepo(coll)
+  private lazy val withStudy = wire[RelayWithStudy]
 
-  private val withStudy = new RelayWithStudy(studyEnv.api)
+  lazy val jsonView = wire[JsonView]
 
-  val api = new RelayApi(
-    repo = repo,
-    studyApi = studyEnv.api,
-    socketMap = studyEnv.socketMap,
-    withStudy = withStudy,
-    clearFormatCache = formatApi.refresh,
-    system = system
-  )
+  lazy val api: RelayApi = wire[RelayApi]
 
-  lazy val pager = new RelayPager(
-    repo = repo,
-    withStudy = withStudy,
-    maxPerPage = lila.common.MaxPerPage(MaxPerPage)
-  )
+  lazy val pager = wire[RelayPager]
 
-  private val sync = new RelaySync(
-    studyApi = studyEnv.api,
-    chapterRepo = studyEnv.chapterRepo
-  )
+  lazy val push = wire[RelayPush]
 
-  lazy val socketHandler = new SocketHandler(
-    studyHandler = studyEnv.socketHandler,
-    api = api
-  )
+  private lazy val sync = wire[RelaySync]
 
-  private lazy val formatApi = new RelayFormatApi(asyncCache)
+  private lazy val formatApi = wire[RelayFormatApi]
 
-  system.actorOf(Props(new RelayFetch(
-    sync = sync,
-    api = api,
-    slackApi = slackApi,
-    formatApi = formatApi,
-    chapterRepo = studyEnv.chapterRepo
-  )))
+  system.actorOf(Props(wire[RelayFetch]))
 
-  system.scheduler.schedule(1 minute, 1 minute) {
+  system.scheduler.scheduleWithFixedDelay(1 minute, 1 minute) { () =>
     api.autoStart >> api.autoFinishNotSyncing
+    ()
   }
 
-  system.lilaBus.subscribeFun('studyLikes, 'study) {
-    case lila.study.actorApi.StudyLikes(id, likes) => api.setLikes(Relay.Id(id.value), likes)
-    case lila.hub.actorApi.study.RemoveStudy(studyId, _) => api.onStudyRemove(studyId)
+  lila.common.Bus.subscribeFun("studyLikes", "study", "relayToggle") {
+    case lila.study.actorApi.StudyLikes(id, likes)       => api.setLikes(Relay.Id(id.value), likes).unit
+    case lila.hub.actorApi.study.RemoveStudy(studyId, _) => api.onStudyRemove(studyId).unit
+    case lila.study.actorApi.RelayToggle(id, v, who) =>
+      studyApi.isContributor(id, who.u) foreach {
+        _ ?? {
+          api.requestPlay(Relay.Id(id.value), v)
+        }
+      }
   }
-}
-
-object Env {
-
-  lazy val current: Env = "relay" boot new Env(
-    db = lila.db.Env.current,
-    config = lila.common.PlayApp loadConfig "relay",
-    studyEnv = lila.study.Env.current,
-    asyncCache = lila.memo.Env.current.asyncCache,
-    slackApi = lila.slack.Env.current.api,
-    system = lila.common.PlayApp.system
-  )
 }

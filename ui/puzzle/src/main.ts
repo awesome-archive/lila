@@ -1,38 +1,26 @@
+import { attributesModule, classModule, init } from 'snabbdom';
 import makeCtrl from './ctrl';
+import menuHover from 'common/menuHover';
 import view from './view/main';
-import sideView from './view/side';
-
 import { Chessground } from 'chessground';
-import { Controller } from './interfaces';
+import { PuzzleOpts } from './interfaces';
 
-import { init } from 'snabbdom';
-import { VNode } from 'snabbdom/vnode'
-import klass from 'snabbdom/modules/class';
-import attributes from 'snabbdom/modules/attributes';
+const patch = init([classModule, attributesModule]);
 
-const patch = init([klass, attributes]);
+export default function (opts: PuzzleOpts): void {
+  const element = document.querySelector('main.puzzle') as HTMLElement;
+  const ctrl = makeCtrl(opts, redraw);
 
-export default function(opts) {
-
-  let vnode: VNode, sideVnode: VNode, ctrl: Controller;
+  const blueprint = view(ctrl);
+  element.innerHTML = '';
+  let vnode = patch(element, blueprint);
 
   function redraw() {
     vnode = patch(vnode, view(ctrl));
-    sideVnode = patch(sideVnode, sideView(ctrl));
   }
 
-  ctrl = makeCtrl(opts, redraw);
-
-  const blueprint = view(ctrl);
-  opts.element.innerHTML = '';
-  vnode = patch(opts.element, blueprint);
-
-  sideVnode = patch(opts.sideElement, sideView(ctrl));
-
-  return {
-    socketReceive: ctrl.socketReceive
-  };
-};
+  menuHover();
+}
 
 // that's for the rest of lichess to access chessground
 // without having to include it a second time

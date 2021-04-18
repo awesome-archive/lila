@@ -2,10 +2,8 @@ package lila.hub
 
 import java.util.concurrent.atomic.AtomicReference
 import java.util.function.UnaryOperator
-import lila.hub.actorApi.Shutdown
 import scala.collection.immutable.Queue
-import scala.concurrent.duration._
-import scala.concurrent.{ Future, Promise }
+import scala.concurrent.{ ExecutionContext, Future, Promise }
 
 /*
  * Like an actor, but not an actor.
@@ -13,7 +11,7 @@ import scala.concurrent.{ Future, Promise }
  * Has an unbounded (!) Queue of messages.
  * Like Duct, but for synchronous message processors.
  */
-trait Trouper extends lila.common.Tellable {
+abstract class Trouper(implicit ec: ExecutionContext) extends lila.common.Tellable {
 
   import Trouper._
 
@@ -22,19 +20,18 @@ trait Trouper extends lila.common.Tellable {
 
   protected var isAlive = true
 
+  def getIsAlive = isAlive
+
   def stop(): Unit = {
     isAlive = false
   }
 
   def !(msg: Any): Unit =
-    if (isAlive && stateRef.getAndUpdate(
-      new UnaryOperator[State] {
-        override def apply(state: State): State = Some(state.fold(Queue.empty[Any])(_ enqueue msg))
-      }
-    ).isEmpty) run(msg)
+    if (isAlive && stateRef.getAndUpdate(state => Some(state.fold(Queue.empty[Any])(_ enqueue msg))).isEmpty)
+      run(msg)
 
   def ask[A](makeMsg: Promise[A] => Any): Fu[A] = {
-    val promise = Promise[A]
+    val promise = Promise[A]()
     this ! makeMsg(promise)
     promise.future
   }
@@ -48,19 +45,17 @@ trait Trouper extends lila.common.Tellable {
    */
   private[this] val stateRef: AtomicReference[State] = new AtomicReference(None)
 
-  private[this] def run(msg: Any): Unit = Future {
-    process.applyOrElse(msg, fallback)
-  } onComplete postRun
+  private[this] def run(msg: Any): Unit =
+    Future {
+      process.applyOrElse(msg, fallback)
+    } onComplete postRun
 
   private[this] val postRun = (_: Any) =>
     stateRef.getAndUpdate(postRunUpdate) flatMap (_.headOption) foreach run
 
-  private val fallback: Receive = {
-    case Shutdown => stop()
-    case msg => lila.log("trouper").warn(s"unhandled msg: $msg")
+  private val fallback: Receive = { case msg =>
+    lila.log("trouper").warn(s"unhandled msg: $msg")
   }
-
-  lazy val uniqueId = Integer.toHexString(hashCode)
 }
 
 object Trouper {
@@ -75,4 +70,11 @@ object Trouper {
         if (q.isEmpty) None else Some(q.tail)
       }
   }
+
+  def stub(implicit ec: ExecutionContext) =
+    new Trouper {
+      val process: Receive = { case msg =>
+        lila.log("trouper").warn(s"stub trouper received: $msg")
+      }
+    }
 }

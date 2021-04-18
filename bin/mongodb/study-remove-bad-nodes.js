@@ -1,4 +1,4 @@
-var studyId = '0Obg93mv';
+// var studyId = '0Obg93mv';
 
 function dig(chapId, node, path) {
   for (var i in node.n) {
@@ -8,15 +8,15 @@ function dig(chapId, node, path) {
       var set = {};
       set[`${path}.n`] = [];
       printjson(set);
-      db.study_chapter.update({_id:chapId},{$set:set});
-    }
-    else {
+      db.study_chapter.update({ _id: chapId }, { $set: set });
+    } else {
       dig(chapId, c, newPath);
     }
   }
 }
 
-db.study_chapter.find({studyId: studyId}).forEach(chap => {
-  print(`${studyId}/${chap._id}`);
+// db.study_chapter.find({studyId: studyId}).forEach(chap => {
+db.study_chapter.find({}).forEach(chap => {
+  print(`${chap.studyId}/${chap._id}`);
   dig(chap._id, chap.root, 'root');
 });

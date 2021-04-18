@@ -1,18 +1,18 @@
 package lila.security
 
 import org.specs2.mutable.Specification
-import org.joda.time.DateTime
+import org.joda.time.Instant
 
 class FloodTest extends Specification {
 
   import Flood._
 
-  def isDup = duplicateMessage _
+  private def isDup = duplicateMessage _
 
-  def m(s: String) = Message(s, new DateTime)
+  private def m(s: String) = Message(s, Instant.now)
 
-  val str = "Implementation uses dynamic programming (Wagner–Fischer algorithm)"
-  val msg = m(str)
+  private val str = "Implementation uses dynamic programming (Wagner–Fischer algorithm)"
+  private val msg = m(str)
 
   "find duplicate" should {
     "same" in {

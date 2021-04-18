@@ -10,11 +10,10 @@ export interface ForecastStep {
   uci: Uci;
   san: San;
   fen: Fen;
-  check?: boolean;
+  check?: Key;
 }
 
 export interface ForecastCtrl {
-  addNodes(fc);
   reloadToLastPly();
   truncate(fc: ForecastStep[]): ForecastStep[];
   playAndSave(node: ForecastStep);

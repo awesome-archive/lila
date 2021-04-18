@@ -1,70 +1,51 @@
 package lila.chat
 
-import akka.actor.{ ActorSystem, Props, ActorSelection }
-import com.typesafe.config.Config
+import akka.actor.ActorSystem
+import com.softwaremill.macwire._
+import io.methvin.play.autoconfig._
+import play.api.Configuration
+import scala.concurrent.duration.FiniteDuration
 
+import lila.common.config._
+
+private case class ChatConfig(
+    @ConfigName("collection.chat") chatColl: CollName,
+    @ConfigName("collection.timeout") timeoutColl: CollName,
+    @ConfigName("actor.name") actorName: String,
+    @ConfigName("timeout.duration") timeoutDuration: FiniteDuration,
+    @ConfigName("timeout.check_every") timeoutCheckEvery: FiniteDuration
+)
+
+@Module
 final class Env(
-    config: Config,
-    db: lila.db.Env,
+    appConfig: Configuration,
+    netDomain: NetDomain,
+    userRepo: lila.user.UserRepo,
+    db: lila.db.Db,
     flood: lila.security.Flood,
     spam: lila.security.Spam,
-    shutup: ActorSelection,
-    modLog: ActorSelection,
-    asyncCache: lila.memo.AsyncCache.Builder,
+    shutup: lila.hub.actors.Shutup,
+    cacheApi: lila.memo.CacheApi
+)(implicit
+    ec: scala.concurrent.ExecutionContext,
     system: ActorSystem
 ) {
 
-  private val settings = new {
-    val CollectionChat = config getString "collection.chat"
-    val CollectionTimeout = config getString "collection.timeout"
-    val MaxLinesPerChat = config getInt "max_lines"
-    val NetDomain = config getString "net.domain"
-    val ActorName = config getString "actor.name"
-    val TimeoutDuration = config duration "timeout.duration"
-    val TimeoutCheckEvery = config duration "timeout.check_every"
-  }
-  import settings._
+  private val config = appConfig.get[ChatConfig]("chat")(AutoConfig.loader)
+  import config._
 
-  val timeout = new ChatTimeout(
-    coll = timeoutColl,
-    duration = TimeoutDuration
+  lazy val timeout = new ChatTimeout(
+    coll = db(timeoutColl),
+    duration = timeoutDuration
   )
 
-  val api = new ChatApi(
-    coll = chatColl,
-    chatTimeout = timeout,
-    flood = flood,
-    spam = spam,
-    shutup = shutup,
-    modLog = modLog,
-    asyncCache = asyncCache,
-    lilaBus = system.lilaBus,
-    maxLinesPerChat = MaxLinesPerChat,
-    netDomain = NetDomain
-  )
+  lazy val coll = db(chatColl)
 
-  val panic = new ChatPanic
+  lazy val api = wire[ChatApi]
 
-  system.scheduler.schedule(TimeoutCheckEvery, TimeoutCheckEvery) {
+  lazy val panic = wire[ChatPanic]
+
+  system.scheduler.scheduleWithFixedDelay(timeoutCheckEvery, timeoutCheckEvery) { () =>
     timeout.checkExpired foreach api.userChat.reinstate
   }
-
-  system.actorOf(Props(new FrontActor(api)), name = ActorName)
-
-  private[chat] lazy val chatColl = db(CollectionChat)
-  private[chat] lazy val timeoutColl = db(CollectionTimeout)
-}
-
-object Env {
-
-  lazy val current: Env = "chat" boot new Env(
-    config = lila.common.PlayApp loadConfig "chat",
-    db = lila.db.Env.current,
-    flood = lila.security.Env.current.flood,
-    spam = lila.security.Env.current.spam,
-    shutup = lila.hub.Env.current.shutup,
-    modLog = lila.hub.Env.current.mod,
-    asyncCache = lila.memo.Env.current.asyncCache,
-    system = lila.common.PlayApp.system
-  )
 }

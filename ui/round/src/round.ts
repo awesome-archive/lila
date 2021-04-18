@@ -1,19 +1,14 @@
 import { RoundData, Step } from './interfaces';
 
-export function firstPly(d: RoundData): number {
-  return d.steps[0].ply;
-}
+export const firstPly = (d: RoundData): number => d.steps[0].ply;
 
-export function lastPly(d: RoundData): number {
-  return d.steps[d.steps.length - 1].ply;
-}
+export const lastPly = (d: RoundData): number => lastStep(d).ply;
 
-export function plyStep(d: RoundData, ply: number): Step {
-  return d.steps[ply - firstPly(d)];
-}
+export const lastStep = (d: RoundData): Step => d.steps[d.steps.length - 1];
 
-export function massage(d: RoundData): void {
+export const plyStep = (d: RoundData, ply: number): Step => d.steps[ply - firstPly(d)];
 
+export const massage = (d: RoundData): void => {
   if (d.clock) {
     d.clock.showTenths = d.pref.clockTenths;
     d.clock.showBar = d.pref.clockBar;
@@ -21,7 +16,7 @@ export function massage(d: RoundData): void {
 
   if (d.correspondence) d.correspondence.showBar = d.pref.clockBar;
 
-  if (['horde', 'crazyhouse'].indexOf(d.game.variant.key) !== -1) d.pref.showCaptured = false;
+  if (['horde', 'crazyhouse'].includes(d.game.variant.key)) d.pref.showCaptured = false;
 
   if (d.expiration) d.expiration.movedAt = Date.now() - d.expiration.idleMillis;
 };

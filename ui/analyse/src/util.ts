@@ -1,44 +1,90 @@
-import { h } from 'snabbdom'
-import { Hooks } from 'snabbdom/hooks'
-import { Attrs } from 'snabbdom/modules/attributes'
+import { h, VNode, Hooks, Attrs } from 'snabbdom';
 import { fixCrazySan } from 'chess';
-import { AnalyseData } from './interfaces';
+
+export const emptyRedButton = 'button.button.button-red.button-empty';
+
+const longPressDuration = 610; // used in bindMobileTapHold
+
+export function clearSelection() {
+  window.getSelection()?.removeAllRanges();
+}
 
 export function plyColor(ply: number): Color {
-  return (ply % 2 === 0) ? 'white' : 'black';
+  return ply % 2 === 0 ? 'white' : 'black';
+}
+
+export function bindMobileMousedown(el: HTMLElement, f: (e: Event) => any, redraw?: () => void) {
+  for (const mousedownEvent of ['touchstart', 'mousedown']) {
+    el.addEventListener(mousedownEvent, e => {
+      f(e);
+      e.preventDefault();
+      if (redraw) redraw();
+    });
+  }
+}
+
+export function bindMobileTapHold(el: HTMLElement, f: (e: Event) => any, redraw?: () => void) {
+  let longPressCountdown: number;
+
+  el.addEventListener('touchstart', e => {
+    longPressCountdown = setTimeout(() => {
+      f(e);
+      if (redraw) redraw();
+    }, longPressDuration);
+  });
+
+  el.addEventListener('touchmove', () => {
+    clearTimeout(longPressCountdown);
+  });
+
+  el.addEventListener('touchcancel', () => {
+    clearTimeout(longPressCountdown);
+  });
+
+  el.addEventListener('touchend', () => {
+    clearTimeout(longPressCountdown);
+  });
+}
+
+function listenTo(el: HTMLElement, eventName: string, f: (e: Event) => any, redraw?: () => void) {
+  el.addEventListener(eventName, e => {
+    const res = f(e);
+    if (res === false) e.preventDefault();
+    if (redraw) redraw();
+    return res;
+  });
 }
 
 export function bind(eventName: string, f: (e: Event) => any, redraw?: () => void): Hooks {
-  return {
-    insert: vnode => {
-      (vnode.elm as HTMLElement).addEventListener(eventName, e => {
-        const res = f(e);
-        if (res === false) {
-          if (e.preventDefault) e.preventDefault();
-          else e.returnValue = false; // ie
-        }
-        if (redraw) redraw();
-        return res;
-      });
-    }
-  };
+  return onInsert(el => listenTo(el, eventName, f, redraw));
 }
+
 export function bindSubmit(f: (e: Event) => any, redraw?: () => void): Hooks {
-  return bind('submit', e => {
-    e.preventDefault();
-    return f(e);
-  }, redraw);
+  return bind(
+    'submit',
+    e => {
+      e.preventDefault();
+      return f(e);
+    },
+    redraw
+  );
+}
+
+export function onInsert<A extends HTMLElement>(f: (element: A) => void): Hooks {
+  return {
+    insert: vnode => f(vnode.elm as A),
+  };
 }
 
 export function readOnlyProp<A>(value: A): () => A {
-  return function(): A {
+  return function (): A {
     return value;
   };
 }
 
 export function dataIcon(icon: string): Attrs {
   return {
-    'data-icon': icon
+    'data-icon': icon,
   };
 }
 
@@ -50,14 +96,8 @@ export function plyToTurn(ply: number): number {
   return Math.floor((ply - 1) / 2) + 1;
 }
 
-export function synthetic(data: AnalyseData): boolean {
-  return data.game.id === 'synthetic';
-}
-
 export function nodeFullName(node: Tree.Node) {
-  if (node.san) return plyToTurn(node.ply) + (
-    node.ply % 2 === 1 ? '.' : '...'
-  ) + ' ' + fixCrazySan(node.san);
+  if (node.san) return plyToTurn(node.ply) + (node.ply % 2 === 1 ? '.' : '...') + ' ' + fixCrazySan(node.san);
   return 'Initial position';
 }
 
@@ -70,12 +110,14 @@ export function titleNameToId(titleName: string): string {
   return (split.length === 1 ? split[0] : split[1]).toLowerCase();
 }
 
-export function spinner() {
+export function spinner(): VNode {
   return h('div.spinner', [
     h('svg', { attrs: { viewBox: '0 0 40 40' } }, [
       h('circle', {
-        attrs: { cx: 20, cy: 20, r: 18, fill: 'none' }
-      })])]);
+        attrs: { cx: 20, cy: 20, r: 18, fill: 'none' },
+      }),
+    ]),
+  ]);
 }
 
 export function innerHTML<A>(a: A, toHtml: (a: A) => string): Hooks {
@@ -89,31 +131,69 @@ export function innerHTML<A>(a: A, toHtml: (a: A) => string): Hooks {
         (vnode.elm as HTMLElement).innerHTML = toHtml(a);
       }
       vnode.data!.cachedA = a;
-    }
+    },
   };
 }
 
-export function toYouTubeEmbed(url: string, height: number = 300): string | undefined {
-  const embedUrl = window.lichess.toYouTubeEmbedUrl(url);
-  if (embedUrl) return `<iframe width="100%" height="${height}" src="${embedUrl}" frameborder=0 allowfullscreen></iframe>`;
+export function richHTML(text: string, newLines = true): Hooks {
+  return innerHTML(text, t => enrichText(t, newLines));
 }
 
-const commentYoutubeRegex = /(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/(?:.*?(?:[?&]v=)|v\/)|youtu\.be\/)(?:[^"&?\/ ]{11})\b/i;
-const imgUrlRegex = /\.(jpg|jpeg|png|gif)$/;
+export function baseUrl() {
+  return `${window.location.protocol}//${window.location.host}`;
+}
+
+export function toYouTubeEmbed(url: string): string | undefined {
+  const embedUrl = toYouTubeEmbedUrl(url);
+  if (embedUrl)
+    return `<div class="embed"><iframe width="100%" src="${embedUrl}" frameborder="0" allow="accelerometer; autoplay; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe></div>`;
+  return undefined;
+}
+
+function toYouTubeEmbedUrl(url: string) {
+  if (!url) return;
+  const m = url.match(
+    /(?:https?:\/\/)?(?:www\.)?(?:youtube\.com|youtu\.be)\/(?:watch)?(?:\?v=)?([^"&?\/ ]{11})(?:\?|&|)(\S*)/i
+  );
+  if (!m) return;
+  let start = 0;
+  m[2].split('&').forEach(function (p) {
+    const s = p.split('=');
+    if (s[0] === 't' || s[0] === 'start') {
+      if (s[1].match(/^\d+$/)) start = parseInt(s[1]);
+      else {
+        const n = s[1].match(/(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?/)!;
+        start = (parseInt(n[1]) || 0) * 3600 + (parseInt(n[2]) || 0) * 60 + (parseInt(n[3]) || 0);
+      }
+    }
+  });
+  const params = 'modestbranding=1&rel=0&controls=2&iv_load_policy=3' + (start ? '&start=' + start : '');
+  return 'https://www.youtube.com/embed/' + m[1] + '?' + params;
+}
+
+export function toTwitchEmbed(url: string): string | undefined {
+  const embedUrl = toTwitchEmbedUrl(url);
+  if (embedUrl)
+    return `<div class="embed"><iframe width="100%" src="${embedUrl}" frameborder=0 allowfullscreen></iframe></div>`;
+  return undefined;
+}
+
+function toTwitchEmbedUrl(url: string) {
+  if (!url) return;
+  const m = url.match(/(?:https?:\/\/)?(?:www\.)?(?:twitch.tv)\/([^"&?/ ]+)/i);
+  if (m) return `https://player.twitch.tv/?channel=${m[1]}&parent=${location.hostname}&autoplay=false`;
+  return undefined;
+}
+
 const newLineRegex = /\n/g;
 
-function imageTag(url: string): string | undefined {
-  if (imgUrlRegex.test(url)) return `<img src="${url}" class="embed"/>`;
-}
-
 function toLink(url: string) {
-  if (commentYoutubeRegex.test(url)) return toYouTubeEmbed(url) || url;
-  const show = imageTag(url) || url.replace(/https?:\/\//, '');
-  return '<a target="_blank" rel="nofollow" href="' + url + '">' + show + '</a>';
+  const show = url.replace(/https?:\/\//, '');
+  return `<a target="_blank" rel="nofollow noopener noreferrer" href="${url}">${show}</a>`;
 }
 
-export function enrichText(text: string, allowNewlines: boolean): string {
-  let html = autolink(window.lichess.escapeHtml(text), toLink);
+export function enrichText(text: string, allowNewlines = true): string {
+  let html = autolink(lichess.escapeHtml(text), toLink);
   if (allowNewlines) html = html.replace(newLineRegex, '<br>');
   return html;
 }
@@ -126,10 +206,34 @@ export function autolink(str: string, callback: (str: string) => string): string
 }
 
 export function option(value: string, current: string | undefined, name: string) {
-  return h('option', {
-    attrs: {
-      value: value,
-      selected: value === current
+  return h(
+    'option',
+    {
+      attrs: {
+        value: value,
+        selected: value === current,
+      },
     },
-  }, name);
+    name
+  );
+}
+
+export function scrollTo(el: HTMLElement | undefined, target: HTMLElement | null) {
+  if (el && target) el.scrollTop = target.offsetTop - el.offsetHeight / 2 + target.offsetHeight / 2;
+}
+
+export function treeReconstruct(parts: any): Tree.Node {
+  const root = parts[0],
+    nb = parts.length;
+  let node = root,
+    i: number;
+  root.id = '';
+  for (i = 1; i < nb; i++) {
+    const n = parts[i];
+    if (node.children) node.children.unshift(n);
+    else node.children = [n];
+    node = n;
+  }
+  node.children = node.children || [];
+  return root;
 }

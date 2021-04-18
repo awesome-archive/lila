@@ -1,31 +1,40 @@
 package lila.fishnet
 
 import org.joda.time.DateTime
-
-import chess.format.{ FEN, Forsyth, Uci }
+import scala.concurrent.duration._
 
 import lila.analyse.AnalysisRepo
-import lila.game.{ Game, GameRepo, UciMemo }
+import lila.game.{ Game, UciMemo }
 
 final class Analyser(
     repo: FishnetRepo,
+    analysisRepo: AnalysisRepo,
+    gameRepo: lila.game.GameRepo,
     uciMemo: UciMemo,
-    sequencer: lila.hub.FutureSequencer,
     evalCache: FishnetEvalCache,
-    limiter: Limiter
+    limiter: FishnetLimiter
+)(implicit
+    ec: scala.concurrent.ExecutionContext,
+    system: akka.actor.ActorSystem
 ) {
 
   val maxPlies = 200
 
+  private val workQueue = new lila.hub.DuctSequencer(maxSize = 256, timeout = 5 seconds, "fishnetAnalyser")
+
   def apply(game: Game, sender: Work.Sender): Fu[Boolean] =
-    (game.metadata.analysed ?? AnalysisRepo.exists(game.id)) flatMap {
-      case true => fuFalse
-      case _ if Game.isOldHorde(game) => fuFalse
+    (game.metadata.analysed ?? analysisRepo.exists(game.id)) flatMap {
+      case true                  => fuFalse
+      case _ if !game.analysable => fuFalse
       case _ =>
-        limiter(sender, ignoreConcurrentCheck = false) flatMap { accepted =>
+        limiter(
+          sender,
+          ignoreConcurrentCheck = false,
+          ownGame = game.userIds contains sender.userId
+        ) flatMap { accepted =>
           accepted ?? {
             makeWork(game, sender) flatMap { work =>
-              sequencer {
+              workQueue {
                 repo getSimilarAnalysis work flatMap {
                   // already in progress, do nothing
                   case Some(similar) if similar.isAcquired => funit
@@ -33,12 +42,12 @@ final class Analyser(
                   case Some(similar) if similar.sender.system && !sender.system =>
                     repo.updateAnalysis(similar.copy(sender = sender))
                   // queued for someone else, do nothing
-                  case Some(similar) => funit
+                  case Some(_) => funit
                   // first request, store
                   case _ =>
-                    lila.mon.fishnet.analysis.requestCount()
+                    lila.mon.fishnet.analysis.requestCount("game").increment()
                     evalCache skipPositions work.game flatMap { skipPositions =>
-                      lila.mon.fishnet.analysis.evalCacheHits(skipPositions.size)
+                      lila.mon.fishnet.analysis.evalCacheHits.record(skipPositions.size)
                       repo addAnalysis work.copy(skipPositions = skipPositions)
                     }
                 }
@@ -49,48 +58,48 @@ final class Analyser(
     }
 
   def apply(gameId: String, sender: Work.Sender): Fu[Boolean] =
-    GameRepo game gameId flatMap { _ ?? { apply(_, sender) } }
+    gameRepo game gameId flatMap { _ ?? { apply(_, sender) } }
 
   def study(req: lila.hub.actorApi.fishnet.StudyChapterRequest): Fu[Boolean] =
-    AnalysisRepo exists req.chapterId flatMap {
+    analysisRepo exists req.chapterId flatMap {
       case true => fuFalse
-      case _ => {
+      case _ =>
         import req._
-        val sender = Work.Sender(req.userId.some, none, false, system = lila.user.User isOfficial req.userId)
-        limiter(sender, ignoreConcurrentCheck = true) flatMap { accepted =>
-          if (!accepted) logger.info(s"Study request declined: ${req.studyId}/${req.chapterId} by $sender")
-          accepted ?? {
-            val work = makeWork(
-              game = Work.Game(
-                id = chapterId,
-                initialFen = initialFen,
-                studyId = studyId.some,
-                variant = variant,
-                moves = moves take maxPlies map (_.uci) mkString " "
-              ),
-              // if black moves first, use 1 as startPly so the analysis doesn't get reversed
-              startPly = initialFen.map(_.value).flatMap(Forsyth.getColor).fold(0)(_.fold(0, 1)),
-              sender = sender
-            )
-            sequencer {
-              repo getSimilarAnalysis work flatMap {
-                _.isEmpty ?? {
-                  lila.mon.fishnet.analysis.requestCount()
-                  evalCache skipPositions work.game flatMap { skipPositions =>
-                    lila.mon.fishnet.analysis.evalCacheHits(skipPositions.size)
-                    repo addAnalysis work.copy(skipPositions = skipPositions)
+        val sender = Work.Sender(req.userId, none, mod = false, system = false)
+        (fuccess(req.unlimited) >>| limiter(sender, ignoreConcurrentCheck = true, ownGame = false)) flatMap {
+          accepted =>
+            if (!accepted) logger.info(s"Study request declined: ${req.studyId}/${req.chapterId} by $sender")
+            accepted ?? {
+              val work = makeWork(
+                game = Work.Game(
+                  id = chapterId,
+                  initialFen = initialFen,
+                  studyId = studyId.some,
+                  variant = variant,
+                  moves = moves take maxPlies map (_.uci) mkString " "
+                ),
+                // if black moves first, use 1 as startPly so the analysis doesn't get reversed
+                startPly = initialFen.flatMap(_.color).??(_.fold(0, 1)),
+                sender = sender
+              )
+              workQueue {
+                repo getSimilarAnalysis work flatMap {
+                  _.isEmpty ?? {
+                    lila.mon.fishnet.analysis.requestCount("study").increment()
+                    evalCache skipPositions work.game flatMap { skipPositions =>
+                      lila.mon.fishnet.analysis.evalCacheHits.record(skipPositions.size)
+                      repo addAnalysis work.copy(skipPositions = skipPositions)
+                    }
                   }
                 }
               }
-            }
-          } inject accepted
+            } inject accepted
         }
-      }
     }
 
   private def makeWork(game: Game, sender: Work.Sender): Fu[Work.Analysis] =
-    GameRepo.initialFen(game) zip uciMemo.get(game) map {
-      case (initialFen, moves) => makeWork(
+    gameRepo.initialFen(game) zip uciMemo.get(game) map { case (initialFen, moves) =>
+      makeWork(
         game = Work.Game(
           id = game.id,
           initialFen = initialFen,

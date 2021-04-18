@@ -5,12 +5,14 @@
 ```sh
 http --form POST l.org/setup/ai variant=1 clock=false time=60 increment=60 level=3 color=random 'Accept:application/vnd.lichess.v1+json'
 ```
+
 - level: 1 to 8
 - color: white | black | random
 - variant: 1 (standard) | 2 (chess960) | 3 (from position) | 4 (KotH) | 5 (three-check)
 - fen: if variant is 3, any valid FEN string
 
 Response: `201 CREATED`
+
 ```javascript
 {
   // see document format in the play.md doc file
@@ -35,11 +37,13 @@ Once connected, you can send seeks over HTTP, using the same clientId
 ```sh
 http --form POST l.org/setup/hook/{clientId} variant=1 clock=false time=60 increment=60 mode=casual 'Accept:application/vnd.lichess.v1+json'
 ```
+
 - clientId: same random ID created by the client and used to connect to the lobby websocket
 - variant: 1 (standard) | 2 (chess960) | 3 (from position) | 4 (KotH)
 - mode: casual | rated
 
 Response: `200 OK`
+
 ```
 ok
 ```
@@ -59,11 +63,13 @@ Now you're waiting for someone to accept the seek. The response will come as a s
 ```sh
 http --form POST l.org/setup/friend?user=usernameOrId variant=1 clock=false time=60 increment=60 color=random 'Accept:application/vnd.lichess.v1+json'
 ```
+
 - color: white | black | random
 - variant: 1 (standard) | 2 (chess960) | 3 (from position) | 4 (KotH) | 5 (three-check)
 - fen: if variant is 3, any valid FEN string
 
 Response: `201 CREATED`
+
 ```javascript
 {
   // see document format in the play.md doc file
@@ -100,7 +106,7 @@ When the challenge is accepted, you will receive a redirect message through the 
 
 ### Declined by the opponent
 
-When the challenge is decline, you will receive a message through the websocket:
+When the challenge is declined, you will receive a message through the websocket:
 
 ```javascript
 // receive
@@ -119,7 +125,7 @@ Listen for this message on any websocket:
 }
 ```
 
-You will receive this every 1,5 seconds aproximatively, until the challenge creator stops sending it.
+You will receive this every 1,5 seconds approximately, until the challenge creator stops sending it.
 The challenge ID is also the game public ID.
 
 ### Fetch game information
@@ -131,6 +137,7 @@ http GET l.org/39b12Ikl 'Accept:application/vnd.lichess.v1+json'
 ```
 
 Response: `200 OK`
+
 ```javascript
 {
   // see document format in the Play section

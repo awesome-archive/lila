@@ -1,53 +1,60 @@
 package lila.security
 
-import play.twirl.api.Html
+import play.api.i18n.Lang
+import scalatags.Text.all._
 
-import lila.common.{ Lang, EmailAddress }
-import lila.user.{ User, UserRepo }
+import lila.common.config._
+import lila.common.EmailAddress
 import lila.i18n.I18nKeys.{ emails => trans }
+import lila.user.{ User, UserRepo }
 
 final class PasswordReset(
-    mailgun: Mailgun,
-    baseUrl: String,
-    tokenerSecret: String
-) {
+    mailer: Mailer,
+    userRepo: UserRepo,
+    baseUrl: BaseUrl,
+    tokenerSecret: Secret
+)(implicit ec: scala.concurrent.ExecutionContext) {
+
+  import Mailer.html._
 
   def send(user: User, email: EmailAddress)(implicit lang: Lang): Funit =
     tokener make user.id flatMap { token =>
-      lila.mon.email.resetPassword()
+      lila.mon.email.send.resetPassword.increment()
       val url = s"$baseUrl/password/reset/confirm/$token"
-      mailgun send Mailgun.Message(
+      mailer send Mailer.Message(
         to = email,
-        subject = trans.passwordReset_subject.literalTxtTo(lang, List(user.username)),
+        subject = trans.passwordReset_subject.txt(user.username),
         text = s"""
-${trans.passwordReset_intro.literalTxtTo(lang)}
+${trans.passwordReset_intro.txt()}
 
-${trans.passwordReset_clickOrIgnore.literalTxtTo(lang)}
+${trans.passwordReset_clickOrIgnore.txt()}
 
 $url
 
-${trans.common_orPaste.literalTxtTo(lang)}
+${trans.common_orPaste.txt()}
 
-${Mailgun.txt.serviceNote}
+${Mailer.txt.serviceNote}
 """,
-        htmlBody = Html(s"""
-<div itemscope itemtype="http://schema.org/EmailMessage">
-  <p itemprop="description">${trans.passwordReset_intro.literalHtmlTo(lang)}</p>
-  <p>${trans.passwordReset_clickOrIgnore.literalHtmlTo(lang)}</p>
-  <div itemprop="potentialAction" itemscope itemtype="http://schema.org/ViewAction">
-    <meta itemprop="name" content="Reset password">
-    ${Mailgun.html.url(url)}
-  </div>
-  ${Mailgun.html.serviceNote}
-</div>""").some
+        htmlBody = emailMessage(
+          pDesc(trans.passwordReset_intro()),
+          p(trans.passwordReset_clickOrIgnore()),
+          potentialAction(metaName("Reset password"), Mailer.html.url(url)),
+          serviceNote
+        ).some
       )
     }
 
   def confirm(token: String): Fu[Option[User]] =
-    tokener read token flatMap { _ ?? UserRepo.byId }
+    tokener read token flatMap { _ ?? userRepo.byId } map {
+      _.filter(_.canFullyLogin)
+    }
 
   private val tokener = new StringToken[User.ID](
     secret = tokenerSecret,
-    getCurrentValue = id => UserRepo getPasswordHash id map (~_)
+    getCurrentValue = id =>
+      for {
+        hash  <- userRepo getPasswordHash id
+        email <- userRepo email id
+      } yield ~hash + email.fold("")(_.value)
   )
 }

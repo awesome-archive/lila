@@ -1,28 +1,29 @@
 package lila.socket
 
 import akka.actor._
-import com.typesafe.config.Config
+import com.softwaremill.macwire._
+import io.lettuce.core._
+import play.api.Configuration
 
-import actorApi._
-
+@Module
 final class Env(
-    system: ActorSystem
+    appConfig: Configuration,
+    shutdown: CoordinatedShutdown,
+    notification: lila.hub.actors.Notification
+)(implicit
+    ec: scala.concurrent.ExecutionContext,
+    akka: ActorSystem
 ) {
 
-  import scala.concurrent.duration._
+  private val RedisUri = appConfig.get[String]("socket.redis.uri")
 
-  private val population = new Population(system)
+  private val redisClient = RedisClient create RedisURI.create(RedisUri)
 
-  private val moveBroadcast = new MoveBroadcast(system)
+  val remoteSocket: RemoteSocket = wire[RemoteSocket]
 
-  private val userRegister = new UserRegister(system)
+  remoteSocket.subscribe("site-in", RemoteSocket.Protocol.In.baseReader)(remoteSocket.baseHandler)
 
-  system.scheduler.schedule(5 seconds, 1 seconds) { population ! PopulationTell }
-}
+  val onlineIds = new OnlineIds(() => remoteSocket.onlineUserIds.get)
 
-object Env {
-
-  lazy val current = "socket" boot new Env(
-    system = lila.common.PlayApp.system
-  )
+  val isOnline = new IsOnline(userId => remoteSocket.onlineUserIds.get contains userId)
 }

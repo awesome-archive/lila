@@ -3,60 +3,62 @@ package lila.timeline
 import akka.actor._
 import org.joda.time.DateTime
 
+import lila.common.config.Max
 import lila.hub.actorApi.timeline.propagation._
-import lila.hub.actorApi.timeline.{ Propagate, Atom, ForumPost, ReloadTimelines }
-import lila.security.{ Granter, Permission }
-import lila.user.UserRepo
+import lila.hub.actorApi.timeline.{ Atom, Propagate, ReloadTimelines }
+import lila.security.Permission
+import lila.user.{ User, UserRepo }
 
-private[timeline] final class Push(
-    bus: lila.common.Bus,
-    renderer: ActorSelection,
-    getFriendIds: String => Fu[Set[String]],
-    getFollowerIds: String => Fu[Set[String]],
+final private[timeline] class Push(
+    relationApi: lila.relation.RelationApi,
+    userRepo: UserRepo,
     entryApi: EntryApi,
     unsubApi: UnsubApi
 ) extends Actor {
 
-  def receive = {
+  implicit def ec = context.dispatcher
 
-    case Propagate(data, propagations) =>
-      propagate(propagations) flatMap { users =>
-        unsubApi.filterUnsub(data.channel, users)
-      } foreach { users =>
-        if (users.nonEmpty) makeEntry(users, data) >>-
-          bus.publish(ReloadTimelines(users), 'lobbySocket)
-        lila.mon.timeline.notification(users.size)
-      }
+  def receive = { case Propagate(data, propagations) =>
+    propagate(propagations) flatMap { users =>
+      unsubApi.filterUnsub(data.channel, users)
+    } foreach { users =>
+      if (users.nonEmpty)
+        makeEntry(users, data) >>-
+          lila.common.Bus.publish(ReloadTimelines(users), "lobbySocket")
+      lila.mon.timeline.notification.increment(users.size)
+    }
   }
 
-  private def propagate(propagations: List[Propagation]): Fu[List[String]] =
-    propagations.map {
-      case Users(ids) => fuccess(ids)
-      case Followers(id) => getFollowerIds(id)
-      case Friends(id) => getFriendIds(id)
+  private def propagate(propagations: List[Propagation]): Fu[List[User.ID]] =
+    scala.concurrent.Future.traverse(propagations) {
+      case Users(ids)    => fuccess(ids)
+      case Followers(id) => relationApi.freshFollowersFromSecondary(id)
+      case Friends(id)   => relationApi.fetchFriends(id)
       case ExceptUser(_) => fuccess(Nil)
-      case ModsOnly(_) => fuccess(Nil)
-    }.sequence flatMap { users =>
+      case ModsOnly(_)   => fuccess(Nil)
+    } flatMap { users =>
       propagations.foldLeft(fuccess(users.flatten.distinct)) {
-        case (fus, ExceptUser(id)) => fus.map(_.filter(id!=))
-        case (fus, ModsOnly(true)) => for {
-          us <- fus
-          userIds <- UserRepo.userIdsWithRoles(modPermissions.map(_.name))
-        } yield us filter userIds.contains
+        case (fus, ExceptUser(id)) => fus.dmap(_.filter(id !=))
+        case (fus, ModsOnly(true)) =>
+          fus flatMap { us =>
+            userRepo.userIdsWithRoles(modPermissions.map(_.dbKey)) dmap { userIds =>
+              us filter userIds.contains
+            }
+          }
         case (fus, _) => fus
       }
     }
 
-  private def modPermissions = List(
-    Permission.ModNote,
-    Permission.Hunter,
-    Permission.Admin,
-    Permission.SuperAdmin
-  )
+  private def modPermissions =
+    List(
+      Permission.ModNote,
+      Permission.Admin,
+      Permission.SuperAdmin
+    )
 
-  private def makeEntry(users: List[String], data: Atom): Fu[Entry] = {
+  private def makeEntry(users: List[User.ID], data: Atom): Fu[Entry] = {
     val entry = Entry.make(data)
-    entryApi.findRecent(entry.typ, DateTime.now minusMinutes 60, 1000) flatMap { entries =>
+    entryApi.findRecent(entry.typ, DateTime.now minusMinutes 60, Max(1000)) flatMap { entries =>
       if (entries.exists(_ similarTo entry)) fufail[Entry]("[timeline] a similar entry already exists")
       else entryApi insert Entry.ForUsers(entry, users) inject entry
     }

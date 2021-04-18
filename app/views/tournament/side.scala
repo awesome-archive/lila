@@ -1,91 +1,129 @@
 package views
 package html.tournament
 
+import controllers.routes
+
 import lila.api.Context
 import lila.app.templating.Environment._
 import lila.app.ui.ScalatagsTemplate._
-
-import controllers.routes
+import lila.common.String.html.markdownLinksOrRichText
+import lila.tournament.{ TeamBattle, Tournament, TournamentShield }
 
 object side {
 
   private val separator = " • "
 
   def apply(
-    tour: lila.tournament.Tournament,
-    verdicts: lila.tournament.Condition.All.WithVerdicts,
-    streamers: Set[lila.user.User.ID],
-    shieldOwner: Option[lila.tournament.TournamentShield.OwnerId]
-  )(implicit ctx: Context) = frag(
-    div(cls := "side_box padded")(
-      div(cls := "game_infos", dataIcon := tour.perfType.map(_.iconChar.toString))(
-        div(cls := "header")(
-          isGranted(_.TerminateTournament) option
-            scalatags.Text.all.form(cls := "terminate", method := "post", action := routes.Tournament.terminate(tour.id), style := "float:right")(
-              button(dataIcon := "j", cls := "submit text fbt confirm", `type` := "submit", title := "Terminates the tournament immediately")
+      tour: Tournament,
+      verdicts: lila.tournament.Condition.All.WithVerdicts,
+      streamers: List[lila.user.User.ID],
+      shieldOwner: Option[TournamentShield.OwnerId],
+      chat: Boolean
+  )(implicit ctx: Context) =
+    frag(
+      div(cls := "tour__meta")(
+        st.section(dataIcon := tour.perfType.iconChar.toString)(
+          div(
+            p(
+              tour.clock.show,
+              separator,
+              if (tour.variant.exotic) {
+                views.html.game.bits.variantLink(
+                  tour.variant,
+                  if (tour.variant == chess.variant.KingOfTheHill) tour.variant.shortName
+                  else tour.variant.name
+                )
+              } else tour.perfType.trans,
+              tour.position.isDefined ?? s"$separator${trans.thematic.txt()}",
+              separator,
+              tour.durationString
             ),
-          span(cls := "setup")(
-            tour.clock.show,
+            tour.mode.fold(trans.casualTournament, trans.ratedTournament)(),
             separator,
-            if (tour.variant.exotic) {
-              views.html.game.bits.variantLink(
-                tour.variant,
-                if (tour.variant == chess.variant.KingOfTheHill) tour.variant.shortName else tour.variant.name,
-                cssClass = "hint--top"
-              )
-            } else tour.perfType.map(_.name),
-            (!tour.position.initial) ?? s"• ${trans.thematic.txt()}",
-            separator,
-            tour.durationString
-          ),
-          tour.mode.fold(trans.casualTournament, trans.ratedTournament)(),
-          separator,
-          systemName(tour.system).capitalize,
-          " ",
-          a(cls := "blue help", href := routes.Tournament.help(tour.system.toString.toLowerCase.some), dataIcon := "")
-        )
-      ),
-      tour.spotlight map { s =>
-        div(cls := "game_infos spotlight")(
-          lila.common.String.html.markdownLinks(s.description),
-          shieldOwner map { owner =>
-            p(cls := "defender", dataIcon := "5")(
-              "Defender:",
-              userIdLink(owner.value.some)
+            "Arena",
+            (isGranted(_.ManageTournament) || (ctx.userId
+              .has(tour.createdBy) && !tour.isFinished)) option frag(
+              " ",
+              a(href := routes.Tournament.edit(tour.id), title := "Edit tournament")(iconTag("%"))
             )
-          }
-        )
-      },
-      verdicts.relevant option div(dataIcon := "7", cls := List(
-        "game_infos conditions" -> true,
-        "accepted" -> (ctx.isAuth && verdicts.accepted),
-        "refused" -> (ctx.isAuth && !verdicts.accepted)
-      ))(
-        (verdicts.list.size < 2) option p(trans.conditionOfEntry()),
-        verdicts.list map { v =>
-          p(cls := List(
-            "condition text" -> true,
-            "accepted" -> v.verdict.accepted,
-            "refused" -> !v.verdict.accepted
-          ))(v.condition.name(ctx.lang))
+          )
+        ),
+        tour.teamBattle map teamBattle(tour),
+        tour.spotlight map { s =>
+          st.section(
+            markdownLinksOrRichText(s.description),
+            shieldOwner map { owner =>
+              p(cls := "defender", dataIcon := "5")(
+                "Defender:",
+                userIdLink(owner.value.some)
+              )
+            }
+          )
+        },
+        tour.description map { d =>
+          st.section(cls := "description")(markdownLinksOrRichText(d))
+        },
+        tour.looksLikePrize option bits.userPrizeDisclaimer(tour.createdBy),
+        verdicts.relevant option st.section(
+          dataIcon := "7",
+          cls := List(
+            "conditions" -> true,
+            "accepted"   -> (ctx.isAuth && verdicts.accepted),
+            "refused"    -> (ctx.isAuth && !verdicts.accepted)
+          )
+        )(
+          div(
+            verdicts.list.sizeIs < 2 option p(trans.conditionOfEntry()),
+            verdicts.list map { v =>
+              p(
+                cls := List(
+                  "condition text" -> true,
+                  "accepted"       -> v.verdict.accepted,
+                  "refused"        -> !v.verdict.accepted
+                )
+              )(v.condition match {
+                case lila.tournament.Condition.TeamMember(teamId, teamName) =>
+                  trans.mustBeInTeam(teamLink(teamId, teamName, withIcon = false))
+                case c => c.name
+              })
+            }
+          )
+        ),
+        tour.noBerserk option div(cls := "text", dataIcon := "`")("No Berserk allowed"),
+        tour.noStreak option div(cls := "text", dataIcon := "Q")("No Arena streaks"),
+        !tour.isScheduled && tour.description.isEmpty option frag(
+          trans.by(userIdLink(tour.createdBy.some)),
+          br
+        ),
+        (!tour.isStarted || (tour.isScheduled && tour.position.isDefined)) option absClientDateTime(
+          tour.startsAt
+        ),
+        tour.startingPosition.map { pos =>
+          p(
+            a(targetBlank, href := pos.url)(strong(pos.eco), " ", pos.name),
+            separator,
+            views.html.base.bits.fenAnalysisLink(pos.fen)
+          )
+        } orElse tour.position.map { fen =>
+          p(
+            "Custom position",
+            separator,
+            views.html.base.bits.fenAnalysisLink(fen)
+          )
         }
       ),
-      tour.noBerserk option div(cls := "text", dataIcon := "`")("No Berserk allowed"),
-      !tour.isScheduled option frag(trans.by(usernameOrId(tour.createdBy)), br),
-      !tour.isStarted option absClientDateTime(tour.startsAt),
-      (!tour.position.initial) ?? frag(
-        br, br,
-        a(target := "_blank", href := tour.position.url)(
-          strong(tour.position.eco),
-          s" ${tour.position.name}"
-        )
+      streamers.nonEmpty option div(cls := "context-streamers")(
+        streamers map views.html.streamer.bits.contextual
+      ),
+      chat option views.html.chat.frag
+    )
+
+  private def teamBattle(tour: Tournament)(battle: TeamBattle)(implicit ctx: Context) =
+    st.section(cls := "team-battle")(
+      p(cls := "team-battle__title text", dataIcon := "f")(
+        s"Battle of ${battle.teams.size} teams and ${battle.nbLeaders} leaders",
+        (ctx.userId.has(tour.createdBy) || isGranted(_.ManageTournament)) option
+          a(href := routes.Tournament.teamBattleEdit(tour.id), title := "Edit team battle")(iconTag("%"))
       )
-    ),
-    streamers.toList map { id =>
-      a(href := routes.Streamer.show(id), cls := "context-streamer text side_box", dataIcon := "")(
-        usernameOrId(id),
-        " is streaming"
-      )
-    }
-  )
+    )
 }

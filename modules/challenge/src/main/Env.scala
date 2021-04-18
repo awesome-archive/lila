@@ -1,104 +1,72 @@
 package lila.challenge
 
-import akka.actor._
-import com.typesafe.config.Config
+import com.softwaremill.macwire._
+import play.api.Configuration
 import scala.concurrent.duration._
 
-import lila.hub.TrouperMap
-import lila.socket.Socket.{ SocketVersion, GetVersion }
-import lila.user.User
+import lila.common.config._
+import lila.socket.Socket.{ GetVersion, SocketVersion }
 
+@Module
 final class Env(
-    config: Config,
-    system: ActorSystem,
-    onStart: String => Unit,
+    appConfig: Configuration,
+    gameRepo: lila.game.GameRepo,
+    userRepo: lila.user.UserRepo,
+    onStart: lila.round.OnStart,
     gameCache: lila.game.Cached,
     lightUser: lila.common.LightUser.GetterSync,
-    isOnline: lila.user.User.ID => Boolean,
-    hub: lila.hub.Env,
-    db: lila.db.Env,
-    asyncCache: lila.memo.AsyncCache.Builder,
-    getPref: User => Fu[lila.pref.Pref],
-    getRelation: (User, User) => Fu[Option[lila.relation.Relation]],
-    scheduler: lila.common.Scheduler
+    lightUserApi: lila.user.LightUserApi,
+    isOnline: lila.socket.IsOnline,
+    db: lila.db.Db,
+    cacheApi: lila.memo.CacheApi,
+    prefApi: lila.pref.PrefApi,
+    relationApi: lila.relation.RelationApi,
+    remoteSocketApi: lila.socket.RemoteSocket,
+    msgApi: lila.msg.MsgApi,
+    baseUrl: BaseUrl
+)(implicit
+    ec: scala.concurrent.ExecutionContext,
+    system: akka.actor.ActorSystem,
+    mode: play.api.Mode
 ) {
 
-  private val settings = new {
-    val CollectionChallenge = config getString "collection.challenge"
-    val MaxPerUser = config getInt "max_per_user"
-    val HistoryMessageTtl = config duration "history.message.ttl"
-    val UidTimeout = config duration "uid.timeout"
-    val SocketTimeout = config duration "socket.timeout"
-    val MaxPlaying = config getInt "max_playing"
-  }
-  import settings._
+  private lazy val maxPlaying = appConfig.get[Max]("setup.max_playing")
 
-  private val socketMap: SocketMap = lila.socket.SocketMap[ChallengeSocket](
-    system = system,
-    mkTrouper = (challengeId: String) => new ChallengeSocket(
-      system = system,
-      challengeId = challengeId,
-      history = new lila.socket.History(ttl = HistoryMessageTtl),
-      getChallenge = repo.byId,
-      uidTtl = UidTimeout,
-      keepMeAlive = () => socketMap touch challengeId
-    ),
-    accessTimeout = SocketTimeout,
-    monitoringName = "challenge.socketMap",
-    broomFrequency = 3677 millis
-  )
+  private val colls = wire[ChallengeColls]
 
   def version(challengeId: Challenge.ID): Fu[SocketVersion] =
-    socketMap.askIfPresentOrZero[SocketVersion](challengeId)(GetVersion)
+    socket.rooms.ask[SocketVersion](challengeId)(GetVersion)
 
-  lazy val socketHandler = new SocketHandler(
-    hub = hub,
-    socketMap = socketMap,
-    pingChallenge = api.ping
-  )
+  private lazy val joiner = wire[ChallengeJoiner]
 
-  lazy val api = new ChallengeApi(
-    repo = repo,
-    joiner = new Joiner(onStart = onStart),
-    jsonView = jsonView,
-    gameCache = gameCache,
-    maxPlaying = MaxPlaying,
-    socketMap = socketMap,
-    asyncCache = asyncCache,
-    lilaBus = system.lilaBus
-  )
+  lazy val maker = wire[ChallengeMaker]
 
-  lazy val granter = new ChallengeGranter(
-    getPref = getPref,
-    getRelation = getRelation
-  )
+  lazy val api = wire[ChallengeApi]
 
-  private lazy val repo = new ChallengeRepo(
-    coll = db(CollectionChallenge),
-    maxPerUser = MaxPerUser
-  )
+  private lazy val socket = wire[ChallengeSocket]
 
-  lazy val jsonView = new JsonView(lightUser, isOnline)
+  lazy val granter = wire[ChallengeGranter]
 
-  scheduler.future(3 seconds, "sweep challenges") {
-    api.sweep
+  private lazy val repo = wire[ChallengeRepo]
+
+  lazy val jsonView = wire[JsonView]
+
+  lazy val bulk = wire[ChallengeBulkApi]
+
+  lazy val msg = wire[ChallengeMsg]
+
+  val forms = new ChallengeForm
+
+  system.scheduler.scheduleWithFixedDelay(10 seconds, 3343 millis) { () =>
+    api.sweep.unit
+  }
+
+  system.scheduler.scheduleWithFixedDelay(20 seconds, 2897 millis) { () =>
+    bulk.tick.unit
   }
 }
 
-object Env {
-
-  lazy val current: Env = "challenge" boot new Env(
-    config = lila.common.PlayApp loadConfig "challenge",
-    system = lila.common.PlayApp.system,
-    onStart = lila.game.Env.current.onStart,
-    hub = lila.hub.Env.current,
-    gameCache = lila.game.Env.current.cached,
-    lightUser = lila.user.Env.current.lightUserSync,
-    isOnline = lila.user.Env.current.isOnline,
-    db = lila.db.Env.current,
-    asyncCache = lila.memo.Env.current.asyncCache,
-    getPref = lila.pref.Env.current.api.getPref,
-    getRelation = lila.relation.Env.current.api.fetchRelation,
-    scheduler = lila.common.PlayApp.scheduler
-  )
+private class ChallengeColls(db: lila.db.Db) {
+  val challenge = db(CollName("challenge"))
+  val bulk      = db(CollName("challenge_bulk"))
 }

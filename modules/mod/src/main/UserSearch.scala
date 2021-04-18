@@ -1,33 +1,52 @@
 package lila.mod
 
+import play.api.data._
+import play.api.data.Forms._
+
 import lila.common.{ EmailAddress, IpAddress }
 import lila.user.{ User, UserRepo }
 
 final class UserSearch(
     securityApi: lila.security.SecurityApi,
-    emailValidator: lila.security.EmailAddressValidator
-) {
+    userRepo: UserRepo
+)(implicit ec: scala.concurrent.ExecutionContext) {
 
-  def apply(query: String): Fu[List[User]] =
-    if (query.isEmpty) fuccess(Nil)
-    else EmailAddress.from(query).map(searchEmail) orElse
-      IpAddress.from(query).map(searchIp) getOrElse
-      (searchUsername(query) zip searchFingerHash(query) map Function.tupled(_ ++ _)) // list concatenation, in case a fingerhash is also someone's username
+  def apply(query: UserSearch.Query): Fu[List[User.WithEmails]] =
+    (~query.as match {
+      case _ => // "exact"
+        EmailAddress.from(query.q).map(searchEmail) orElse
+          IpAddress.from(query.q).map(searchIp) getOrElse
+          searchUsername(query.q)
+    }) flatMap userRepo.withEmailsU
 
   private def searchIp(ip: IpAddress) =
-    securityApi recentUserIdsByIp ip map (_.reverse) flatMap UserRepo.usersFromSecondary
+    securityApi recentUserIdsByIp ip map (_.reverse) flatMap userRepo.usersFromSecondary
 
-  private def searchFingerHash(fh: String): Fu[List[User]] =
-    (fh.size == 8) ?? {
-      securityApi recentUserIdsByFingerHash lila.security.FingerHash(fh) map (_.reverse) flatMap UserRepo.usersFromSecondary
+  private def searchUsername(username: String) = userRepo named username map (_.toList)
+
+  private def searchEmail(email: EmailAddress): Fu[List[User]] = {
+    val normalized = email.normalize
+    userRepo.byEmail(normalized) flatMap { current =>
+      userRepo.byPrevEmail(normalized) map current.toList.:::
     }
+  }
+}
 
-  private def searchUsername(username: String) = UserRepo named username map (_.toList)
+object UserSearch {
 
-  private def searchEmail(email: EmailAddress): Fu[List[User]] =
-    emailValidator.validate(email) ?? { fixed =>
-      UserRepo.byEmail(fixed) flatMap { current =>
-        UserRepo.byPrevEmail(fixed) map current.toList.:::
-      }
-    }
+  val asChoices = List(
+    "exact" -> "Exact match over all users"
+  )
+  val asValues = asChoices.map(_._1)
+
+  case class Query(q: String, as: Option[String])
+
+  def exact(q: String) = Query(q, none)
+
+  val form = Form(
+    mapping(
+      "q"  -> nonEmptyText,
+      "as" -> optional(nonEmptyText.verifying(asValues contains _))
+    )(Query.apply)(Query.unapply)
+  )
 }

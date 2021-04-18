@@ -1,41 +1,38 @@
 package lila.study
 
 import chess.format.pgn.{ Glyph, Glyphs, Tag, Tags }
-import chess.format.{ Uci, UciCharPair, FEN }
-import chess.variant.{ Variant, Crazyhouse }
-import chess.{ Centis, Pos, Role, PromotableRole }
+import chess.format.{ FEN, Uci, UciCharPair }
+import chess.variant.{ Crazyhouse, Variant }
+import chess.{ Centis, Color, Pos, PromotableRole, Role }
 import org.joda.time.DateTime
-import reactivemongo.bson._
+import reactivemongo.api.bson._
+import scala.util.Success
 
+import lila.common.Iso
 import lila.db.BSON
 import lila.db.BSON.{ Reader, Writer }
 import lila.db.dsl._
-import lila.game.BSONHandlers.FENBSONHandler
 import lila.tree.Eval
 import lila.tree.Eval.Score
-import lila.tree.Node.{ Shape, Shapes, Comment, Comments, Gamebook }
-
-import lila.common.Iso
-import lila.common.Iso._
+import lila.tree.Node.{ Comment, Comments, Gamebook, Shape, Shapes }
 
 object BSONHandlers {
 
   import Chapter._
 
-  implicit val StudyIdBSONHandler = stringIsoHandler(Study.idIso)
-  implicit val StudyNameBSONHandler = stringIsoHandler(Study.nameIso)
-  implicit val ChapterIdBSONHandler = stringIsoHandler(Chapter.idIso)
+  implicit val StudyIdBSONHandler     = stringIsoHandler(Study.idIso)
+  implicit val StudyNameBSONHandler   = stringIsoHandler(Study.nameIso)
+  implicit val ChapterIdBSONHandler   = stringIsoHandler(Chapter.idIso)
   implicit val ChapterNameBSONHandler = stringIsoHandler(Chapter.nameIso)
-  implicit val CentisBSONHandler = intIsoHandler(Iso.centisIso)
+  implicit val CentisBSONHandler      = intIsoHandler(Iso.centisIso)
+  implicit val StudyTopicBSONHandler  = stringIsoHandler(StudyTopic.topicIso)
+  implicit val StudyTopicsBSONHandler =
+    implicitly[BSONHandler[List[StudyTopic]]].as[StudyTopics](StudyTopics.apply, _.value)
 
-  private implicit val PosBSONHandler = new BSONHandler[BSONString, Pos] {
-    def read(bsonStr: BSONString): Pos = Pos.posAt(bsonStr.value) err s"No such pos: ${bsonStr.value}"
-    def write(x: Pos) = BSONString(x.key)
-  }
-  implicit val ColorBSONHandler = new BSONHandler[BSONBoolean, chess.Color] {
-    def read(b: BSONBoolean) = chess.Color(b.value)
-    def write(c: chess.Color) = BSONBoolean(c.white)
-  }
+  implicit private val PosBSONHandler = tryHandler[Pos](
+    { case BSONString(v) => Pos.fromKey(v) toTry s"No such pos: $v" },
+    x => BSONString(x.key)
+  )
 
   implicit val ShapeBSONHandler = new BSON[Shape] {
     def reads(r: Reader) = {
@@ -44,300 +41,336 @@ object BSONHandlers {
         Shape.Circle(brush, pos)
       } getOrElse Shape.Arrow(brush, r.get[Pos]("o"), r.get[Pos]("d"))
     }
-    def writes(w: Writer, t: Shape) = t match {
-      case Shape.Circle(brush, pos) => $doc("b" -> brush, "p" -> pos.key)
-      case Shape.Arrow(brush, orig, dest) => $doc("b" -> brush, "o" -> orig.key, "d" -> dest.key)
-    }
+    def writes(w: Writer, t: Shape) =
+      t match {
+        case Shape.Circle(brush, pos)       => $doc("b" -> brush, "p" -> pos.key)
+        case Shape.Arrow(brush, orig, dest) => $doc("b" -> brush, "o" -> orig.key, "d" -> dest.key)
+      }
   }
 
-  implicit val PromotableRoleHandler = new BSONHandler[BSONString, PromotableRole] {
-    def read(bsonStr: BSONString): PromotableRole = bsonStr.value.headOption flatMap Role.allPromotableByForsyth.get err s"No such role: ${bsonStr.value}"
-    def write(x: PromotableRole) = BSONString(x.forsyth.toString)
-  }
+  implicit val PromotableRoleHandler = tryHandler[PromotableRole](
+    { case BSONString(v) => v.headOption flatMap Role.allPromotableByForsyth.get toTry s"No such role: $v" },
+    x => BSONString(x.forsyth.toString)
+  )
 
-  implicit val RoleHandler = new BSONHandler[BSONString, Role] {
-    def read(bsonStr: BSONString): Role = bsonStr.value.headOption flatMap Role.allByForsyth.get err s"No such role: ${bsonStr.value}"
-    def write(x: Role) = BSONString(x.forsyth.toString)
-  }
+  implicit val RoleHandler = tryHandler[Role](
+    { case BSONString(v) => v.headOption flatMap Role.allByForsyth.get toTry s"No such role: $v" },
+    x => BSONString(x.forsyth.toString)
+  )
 
-  implicit val UciHandler = new BSONHandler[BSONString, Uci] {
-    def read(bs: BSONString): Uci = Uci(bs.value) err s"Bad UCI: ${bs.value}"
-    def write(x: Uci) = BSONString(x.uci)
-  }
+  implicit val UciHandler = tryHandler[Uci](
+    { case BSONString(v) => Uci(v) toTry s"Bad UCI: $v" },
+    x => BSONString(x.uci)
+  )
 
-  implicit val UciCharPairHandler = new BSONHandler[BSONString, UciCharPair] {
-    def read(bsonStr: BSONString): UciCharPair = bsonStr.value.toArray match {
-      case Array(a, b) => UciCharPair(a, b)
-      case _ => sys error s"Invalid UciCharPair ${bsonStr.value}"
-    }
-    def write(x: UciCharPair) = BSONString(x.toString)
-  }
+  implicit val UciCharPairHandler = tryHandler[UciCharPair](
+    { case BSONString(v) =>
+      v.toArray match {
+        case Array(a, b) => Success(UciCharPair(a, b))
+        case _           => handlerBadValue(s"Invalid UciCharPair $v")
+      }
+    },
+    x => BSONString(x.toString)
+  )
 
   import Study.IdName
   implicit val StudyIdNameBSONHandler = Macros.handler[IdName]
 
   import Uci.WithSan
-  private implicit val UciWithSanBSONHandler = Macros.handler[WithSan]
 
-  implicit val ShapesBSONHandler: BSONHandler[BSONArray, Shapes] =
-    isoHandler[Shapes, List[Shape], BSONArray](
-      (s: Shapes) => s.value,
-      Shapes(_)
-    )
+  implicit val ShapesBSONHandler: BSONHandler[Shapes] =
+    isoHandler[Shapes, List[Shape]]((s: Shapes) => s.value, Shapes(_))
 
-  private implicit val CommentIdBSONHandler = stringAnyValHandler[Comment.Id](_.value, Comment.Id.apply)
-  private implicit val CommentTextBSONHandler = stringAnyValHandler[Comment.Text](_.value, Comment.Text.apply)
-  implicit val CommentAuthorBSONHandler = new BSONHandler[BSONValue, Comment.Author] {
-    def read(bsonValue: BSONValue): Comment.Author = bsonValue match {
-      case BSONString(lila.user.User.lichessId) => Comment.Author.Lichess
-      case BSONString(name) => Comment.Author.External(name)
-      case doc: Bdoc => {
-        for {
-          id <- doc.getAs[String]("id")
-          name <- doc.getAs[String]("name")
-        } yield Comment.Author.User(id, name)
-      } err s"Invalid comment author $doc"
+  implicit private val CommentIdBSONHandler   = stringAnyValHandler[Comment.Id](_.value, Comment.Id.apply)
+  implicit private val CommentTextBSONHandler = stringAnyValHandler[Comment.Text](_.value, Comment.Text.apply)
+  implicit val CommentAuthorBSONHandler = quickHandler[Comment.Author](
+    {
+      case BSONString(lila.user.User.lichessId | "l") => Comment.Author.Lichess
+      case BSONString(name)                           => Comment.Author.External(name)
+      case doc: Bdoc =>
+        {
+          for {
+            id   <- doc.getAsOpt[String]("id")
+            name <- doc.getAsOpt[String]("name")
+          } yield Comment.Author.User(id, name)
+        } err s"Invalid comment author $doc"
       case _ => Comment.Author.Unknown
-    }
-    def write(x: Comment.Author): BSONValue = x match {
+    },
+    {
       case Comment.Author.User(id, name) => $doc("id" -> id, "name" -> name)
       case Comment.Author.External(name) => BSONString(s"${name.trim}")
-      case Comment.Author.Lichess => BSONString("l")
-      case Comment.Author.Unknown => BSONString("")
+      case Comment.Author.Lichess        => BSONString("l")
+      case Comment.Author.Unknown        => BSONString("")
     }
-  }
-  private implicit val CommentBSONHandler = Macros.handler[Comment]
+  )
+  implicit private val CommentBSONHandler = Macros.handler[Comment]
 
-  implicit val CommentsBSONHandler: BSONHandler[BSONArray, Comments] =
-    isoHandler[Comments, List[Comment], BSONArray](
-      (s: Comments) => s.value,
-      Comments(_)
-    )
+  implicit val CommentsBSONHandler: BSONHandler[Comments] =
+    isoHandler[Comments, List[Comment]]((s: Comments) => s.value, Comments(_))
 
   implicit val GamebookBSONHandler = Macros.handler[Gamebook]
 
-  private implicit def CrazyDataBSONHandler: BSON[Crazyhouse.Data] = new BSON[Crazyhouse.Data] {
-    private def writePocket(p: Crazyhouse.Pocket) = p.roles.map(_.forsyth).mkString
-    private def readPocket(p: String) = Crazyhouse.Pocket(p.flatMap(chess.Role.forsyth)(scala.collection.breakOut))
-    def reads(r: Reader) = Crazyhouse.Data(
-      promoted = r.getsD[Pos]("o").toSet,
-      pockets = Crazyhouse.Pockets(
-        white = readPocket(r.strD("w")),
-        black = readPocket(r.strD("b"))
-      )
-    )
-    def writes(w: Writer, s: Crazyhouse.Data) = $doc(
-      "o" -> w.listO(s.promoted.toList),
-      "w" -> w.strO(writePocket(s.pockets.white)),
-      "b" -> w.strO(writePocket(s.pockets.black))
-    )
-  }
-
-  implicit val GlyphsBSONHandler = new BSONHandler[Barr, Glyphs] {
-    private val idsHandler = bsonArrayToListHandler[Int]
-    def read(b: Barr) = Glyphs.fromList(idsHandler read b flatMap Glyph.find)
-    // must be BSONArray and not $arr!
-    def write(x: Glyphs) = BSONArray(x.toList.map(_.id).map(BSONInteger.apply))
-  }
-
-  implicit val EvalScoreBSONHandler = new BSONHandler[BSONInteger, Score] {
-    private val mateFactor = 1000000
-    def read(i: BSONInteger) = Score {
-      val v = i.value
-      if (v >= mateFactor || v <= -mateFactor) Right(Eval.Mate(v / mateFactor))
-      else Left(Eval.Cp(v))
+  implicit private def CrazyDataBSONHandler: BSON[Crazyhouse.Data] =
+    new BSON[Crazyhouse.Data] {
+      private def writePocket(p: Crazyhouse.Pocket) = p.roles.map(_.forsyth).mkString
+      private def readPocket(p: String)             = Crazyhouse.Pocket(p.view.flatMap(chess.Role.forsyth).toList)
+      def reads(r: Reader) =
+        Crazyhouse.Data(
+          promoted = r.getsD[Pos]("o").toSet,
+          pockets = Crazyhouse.Pockets(
+            white = readPocket(r.strD("w")),
+            black = readPocket(r.strD("b"))
+          )
+        )
+      def writes(w: Writer, s: Crazyhouse.Data) =
+        $doc(
+          "o" -> w.listO(s.promoted.toList),
+          "w" -> w.strO(writePocket(s.pockets.white)),
+          "b" -> w.strO(writePocket(s.pockets.black))
+        )
     }
-    def write(e: Score) = BSONInteger {
-      e.value.fold(
+
+  implicit val GlyphsBSONHandler = {
+    val intReader = collectionReader[List, Int]
+    tryHandler[Glyphs](
+      { case arr: Barr =>
+        intReader.readTry(arr) map { ints =>
+          Glyphs.fromList(ints flatMap Glyph.find)
+        }
+      },
+      x => BSONArray(x.toList.map(_.id).map(BSONInteger.apply))
+    )
+  }
+
+  implicit val EvalScoreBSONHandler = {
+    val mateFactor = 1000000
+    BSONIntegerHandler.as[Score](
+      v =>
+        Score {
+          if (v >= mateFactor || v <= -mateFactor) Right(Eval.Mate(v / mateFactor))
+          else Left(Eval.Cp(v))
+        },
+      _.value.fold(
         cp => cp.value atLeast (-mateFactor + 1) atMost (mateFactor - 1),
         mate => mate.value * mateFactor
       )
-    }
+    )
   }
 
-  implicit def NodeBSONHandler: BSON[Node] = new BSON[Node] {
-    def reads(r: Reader) = Node(
-      id = r.get[UciCharPair]("i"),
-      ply = r int "p",
-      move = WithSan(r.get[Uci]("u"), r.str("s")),
-      fen = r.get[FEN]("f"),
-      check = r boolD "c",
-      shapes = r.getO[Shapes]("h") | Shapes.empty,
-      comments = r.getO[Comments]("co") | Comments.empty,
-      gamebook = r.getO[Gamebook]("ga"),
-      glyphs = r.getO[Glyphs]("g") | Glyphs.empty,
-      score = r.getO[Score]("e"),
-      crazyData = r.getO[Crazyhouse.Data]("z"),
-      clock = r.getO[Centis]("l"),
-      children = r.get[Node.Children]("n"),
-      forceVariation = r boolD "fv"
-    )
-    def writes(w: Writer, s: Node) = $doc(
-      "i" -> s.id,
-      "p" -> s.ply,
-      "u" -> s.move.uci,
-      "s" -> s.move.san,
-      "f" -> s.fen,
-      "c" -> w.boolO(s.check),
-      "h" -> s.shapes.value.nonEmpty.option(s.shapes),
-      "co" -> s.comments.value.nonEmpty.option(s.comments),
-      "ga" -> s.gamebook,
-      "g" -> s.glyphs.nonEmpty,
-      "e" -> s.score,
-      "l" -> s.clock,
-      "z" -> s.crazyData,
-      "n" -> (if (s.ply < Node.MAX_PLIES) s.children else Node.emptyChildren),
-      "fv" -> w.boolO(s.forceVariation)
+  def readNode(doc: Bdoc, id: UciCharPair): Option[Node] = {
+    import Node.{ BsonFields => F }
+    for {
+      ply <- doc.getAsOpt[Int](F.ply)
+      uci <- doc.getAsOpt[Uci](F.uci)
+      san <- doc.getAsOpt[String](F.san)
+      fen <- doc.getAsOpt[FEN](F.fen)
+      check          = ~doc.getAsOpt[Boolean](F.check)
+      shapes         = doc.getAsOpt[Shapes](F.shapes) getOrElse Shapes.empty
+      comments       = doc.getAsOpt[Comments](F.comments) getOrElse Comments.empty
+      gamebook       = doc.getAsOpt[Gamebook](F.gamebook)
+      glyphs         = doc.getAsOpt[Glyphs](F.glyphs) getOrElse Glyphs.empty
+      score          = doc.getAsOpt[Score](F.score)
+      clock          = doc.getAsOpt[Centis](F.clock)
+      crazy          = doc.getAsOpt[Crazyhouse.Data](F.crazy)
+      forceVariation = ~doc.getAsOpt[Boolean](F.forceVariation)
+    } yield Node(
+      id,
+      ply,
+      WithSan(uci, san),
+      fen,
+      check,
+      shapes,
+      comments,
+      gamebook,
+      glyphs,
+      score,
+      clock,
+      crazy,
+      Node.emptyChildren,
+      forceVariation
     )
   }
+
+  def writeNode(n: Node) = {
+    import Node.BsonFields._
+    val w = new Writer
+    $doc(
+      ply            -> n.ply,
+      uci            -> n.move.uci,
+      san            -> n.move.san,
+      fen            -> n.fen,
+      check          -> w.boolO(n.check),
+      shapes         -> n.shapes.value.nonEmpty.option(n.shapes),
+      comments       -> n.comments.value.nonEmpty.option(n.comments),
+      gamebook       -> n.gamebook,
+      glyphs         -> n.glyphs.nonEmpty,
+      score          -> n.score,
+      clock          -> n.clock,
+      crazy          -> n.crazyData,
+      forceVariation -> w.boolO(n.forceVariation),
+      order -> {
+        (n.children.nodes.sizeIs > 1) option n.children.nodes.map(_.id)
+      }
+    )
+  }
+
   import Node.Root
-  private[study] implicit def NodeRootBSONHandler: BSON[Root] = new BSON[Root] {
-    def reads(r: Reader) = Root(
-      ply = r int "p",
-      fen = r.get[FEN]("f"),
-      check = r boolD "c",
-      shapes = r.getO[Shapes]("h") | Shapes.empty,
-      comments = r.getO[Comments]("co") | Comments.empty,
-      gamebook = r.getO[Gamebook]("ga"),
-      glyphs = r.getO[Glyphs]("g") | Glyphs.empty,
-      score = r.getO[Score]("e"),
-      clock = r.getO[Centis]("l"),
-      crazyData = r.getO[Crazyhouse.Data]("z"),
-      children = r.get[Node.Children]("n")
-    )
-    def writes(w: Writer, s: Root) = $doc(
-      "p" -> s.ply,
-      "f" -> s.fen,
-      "c" -> w.boolO(s.check),
-      "h" -> s.shapes.value.nonEmpty.option(s.shapes),
-      "co" -> s.comments.value.nonEmpty.option(s.comments),
-      "ga" -> s.gamebook,
-      "g" -> s.glyphs.nonEmpty,
-      "e" -> s.score,
-      "l" -> s.clock,
-      "z" -> s.crazyData,
-      "n" -> s.children
-    )
-  }
-  implicit val ChildrenBSONHandler = new BSONHandler[Barr, Node.Children] {
-    private val nodesHandler = bsonArrayToVectorHandler[Node]
-    def read(b: Barr) = try {
-      Node.Children(nodesHandler read b)
-    } catch {
-      case e: StackOverflowError =>
-        println(s"study handler ${e.toString}")
-        Node.emptyChildren
+  implicit private[study] lazy val NodeRootBSONHandler: BSON[Root] = new BSON[Root] {
+    import Node.BsonFields._
+    def reads(fullReader: Reader) = {
+      val rootNode = fullReader.doc.getAsOpt[Bdoc](Path.rootDbKey) err "Missing root"
+      val r        = new Reader(rootNode)
+      Root(
+        ply = r int ply,
+        fen = r.get[FEN](fen),
+        check = r boolD check,
+        shapes = r.getO[Shapes](shapes) | Shapes.empty,
+        comments = r.getO[Comments](comments) | Comments.empty,
+        gamebook = r.getO[Gamebook](gamebook),
+        glyphs = r.getO[Glyphs](glyphs) | Glyphs.empty,
+        score = r.getO[Score](score),
+        clock = r.getO[Centis](clock),
+        crazyData = r.getO[Crazyhouse.Data](crazy),
+        children = StudyFlatTree.reader.rootChildren(fullReader.doc)
+      )
     }
-    def write(x: Node.Children) = try {
-      nodesHandler write x.nodes
-    } catch {
-      case e: StackOverflowError =>
-        println(s"study handler ${e.toString}")
-        $arr()
-    }
+    def writes(w: Writer, r: Root) = $doc(
+      StudyFlatTree.writer.rootChildren(r) appended {
+        Path.rootDbKey -> $doc(
+          ply      -> r.ply,
+          fen      -> r.fen,
+          check    -> r.check.some.filter(identity),
+          shapes   -> r.shapes.value.nonEmpty.option(r.shapes),
+          comments -> r.comments.value.nonEmpty.option(r.comments),
+          gamebook -> r.gamebook,
+          glyphs   -> r.glyphs.nonEmpty,
+          score    -> r.score,
+          clock    -> r.clock,
+          crazy    -> r.crazyData
+        )
+      }
+    )
   }
 
-  implicit val PathBSONHandler = new BSONHandler[BSONString, Path] {
-    def read(b: BSONString): Path = Path(b.value)
-    def write(x: Path) = BSONString(x.toString)
-  }
-  implicit val VariantBSONHandler = new BSONHandler[BSONInteger, Variant] {
-    def read(b: BSONInteger): Variant = Variant(b.value) err s"No such variant: ${b.value}"
-    def write(x: Variant) = BSONInteger(x.id)
-  }
+  implicit val PathBSONHandler = BSONStringHandler.as[Path](Path.apply, _.toString)
+  implicit val VariantBSONHandler = tryHandler[Variant](
+    { case BSONInteger(v) => Variant(v) toTry s"No such variant: $v" },
+    x => BSONInteger(x.id)
+  )
 
-  implicit val PgnTagBSONHandler = new BSONHandler[BSONString, Tag] {
-    def read(b: BSONString): Tag = b.value.split(":", 2) match {
-      case Array(name, value) => Tag(name, value)
-      case _ => sys error s"Invalid pgn tag ${b.value}"
-    }
-    def write(t: Tag) = BSONString(s"${t.name}:${t.value}")
-  }
-  implicit val PgnTagsBSONHandler: BSONHandler[BSONArray, Tags] =
-    isoHandler[Tags, List[Tag], BSONArray](
-      (s: Tags) => s.value,
-      Tags(_)
-    )
-  private implicit val ChapterSetupBSONHandler = Macros.handler[Chapter.Setup]
-  implicit val ChapterRelayBSONHandler = Macros.handler[Chapter.Relay]
-  implicit val ChapterServerEvalBSONHandler = Macros.handler[Chapter.ServerEval]
+  implicit val PgnTagBSONHandler = tryHandler[Tag](
+    { case BSONString(v) =>
+      v.split(":", 2) match {
+        case Array(name, value) => Success(Tag(name, value))
+        case _                  => handlerBadValue(s"Invalid pgn tag $v")
+      }
+    },
+    t => BSONString(s"${t.name}:${t.value}")
+  )
+  implicit val tagsHandler                     = implicitly[BSONHandler[List[Tag]]].as[Tags](Tags.apply, _.value)
+  implicit private val ChapterSetupBSONHandler = Macros.handler[Chapter.Setup]
+  implicit val ChapterRelayBSONHandler         = Macros.handler[Chapter.Relay]
+  implicit val ChapterServerEvalBSONHandler    = Macros.handler[Chapter.ServerEval]
   import Chapter.Ply
-  implicit val PlyBSONHandler = intAnyValHandler[Ply](_.value, Ply.apply)
+  implicit val PlyBSONHandler     = intAnyValHandler[Ply](_.value, Ply.apply)
   implicit val ChapterBSONHandler = Macros.handler[Chapter]
-  implicit val ChapterMetadataBSONHandler = Macros.handler[Chapter.Metadata]
 
-  private implicit val ChaptersMap = BSON.MapDocument.MapHandler[Chapter.Id, Chapter]
-
-  implicit val PositionRefBSONHandler = new BSONHandler[BSONString, Position.Ref] {
-    def read(b: BSONString) = Position.Ref.decode(b.value) err s"Invalid position ${b.value}"
-    def write(x: Position.Ref) = BSONString(x.encode)
+  implicit val PositionRefBSONHandler = tryHandler[Position.Ref](
+    { case BSONString(v) => Position.Ref.decode(v) toTry s"Invalid position $v" },
+    x => BSONString(x.encode)
+  )
+  implicit val StudyMemberRoleBSONHandler = tryHandler[StudyMember.Role](
+    { case BSONString(v) => StudyMember.Role.byId get v toTry s"Invalid role $v" },
+    x => BSONString(x.id)
+  )
+  private case class DbMember(role: StudyMember.Role) extends AnyVal
+  implicit private val DbMemberBSONHandler = Macros.handler[DbMember]
+  implicit private[study] val StudyMemberBSONWriter = new BSONWriter[StudyMember] {
+    def writeTry(x: StudyMember) = DbMemberBSONHandler writeTry DbMember(x.role)
   }
-  implicit val StudyMemberRoleBSONHandler = new BSONHandler[BSONString, StudyMember.Role] {
-    def read(b: BSONString) = StudyMember.Role.byId get b.value err s"Invalid role ${b.value}"
-    def write(x: StudyMember.Role) = BSONString(x.id)
-  }
-  private case class DbMember(role: StudyMember.Role, addedAt: DateTime)
-  private implicit val DbMemberBSONHandler = Macros.handler[DbMember]
-  private[study] implicit val StudyMemberBSONWriter = new BSONWriter[StudyMember, Bdoc] {
-    def write(x: StudyMember) = DbMemberBSONHandler write DbMember(x.role, x.addedAt)
-  }
-  private[study] implicit val MembersBSONHandler = new BSONHandler[Bdoc, StudyMembers] {
-    private val mapHandler = BSON.MapDocument.MapHandler[String, DbMember]
-    def read(b: Bdoc) = StudyMembers(mapHandler read b map {
-      case (id, dbMember) => id -> StudyMember(id, dbMember.role, dbMember.addedAt)
-    })
-    def write(x: StudyMembers) = BSONDocument(x.members.mapValues(StudyMemberBSONWriter.write))
-  }
-  import Study.Visibility
-  private[study] implicit val VisibilityHandler: BSONHandler[BSONString, Visibility] = new BSONHandler[BSONString, Visibility] {
-    def read(bs: BSONString) = Visibility.byKey get bs.value err s"Invalid visibility ${bs.value}"
-    def write(x: Visibility) = BSONString(x.key)
-  }
-  import Study.From
-  private[study] implicit val FromHandler: BSONHandler[BSONString, From] = new BSONHandler[BSONString, From] {
-    def read(bs: BSONString) = bs.value.split(' ') match {
-      case Array("scratch") => From.Scratch
-      case Array("game", id) => From.Game(id)
-      case Array("study", id) => From.Study(Study.Id(id))
-      case Array("relay") => From.Relay(none)
-      case Array("relay", id) => From.Relay(Study.Id(id).some)
-      case _ => sys error s"Invalid from ${bs.value}"
-    }
-    def write(x: From) = BSONString(x match {
-      case From.Scratch => "scratch"
-      case From.Game(id) => s"game $id"
-      case From.Study(id) => s"study $id"
-      case From.Relay(id) => s"relay${id.fold("")(" " + _)}"
-    })
-  }
-  import Settings.UserSelection
-  private[study] implicit val UserSelectionHandler: BSONHandler[BSONString, UserSelection] = new BSONHandler[BSONString, UserSelection] {
-    def read(bs: BSONString) = UserSelection.byKey get bs.value err s"Invalid user selection ${bs.value}"
-    def write(x: UserSelection) = BSONString(x.key)
-  }
-  implicit val SettingsBSONHandler = new BSON[Settings] {
-    def reads(r: Reader) = Settings(
-      computer = r.get[UserSelection]("computer"),
-      explorer = r.get[UserSelection]("explorer"),
-      cloneable = r.getO[UserSelection]("cloneable") | Settings.init.cloneable,
-      chat = r.getO[UserSelection]("chat") | Settings.init.chat,
-      sticky = r.getO[Boolean]("sticky") | Settings.init.sticky
+  implicit private[study] val MembersBSONHandler: BSONHandler[StudyMembers] =
+    implicitly[BSONHandler[Map[String, DbMember]]].as[StudyMembers](
+      members =>
+        StudyMembers(members map { case (id, dbMember) =>
+          id -> StudyMember(id, dbMember.role)
+        }),
+      _.members.view.mapValues(m => DbMember(m.role)).toMap
     )
-    private val writer = Macros.writer[Settings]
-    def writes(w: Writer, s: Settings) = writer write s
+  import Study.Visibility
+  implicit private[study] val VisibilityHandler = tryHandler[Visibility](
+    { case BSONString(v) => Visibility.byKey get v toTry s"Invalid visibility $v" },
+    v => BSONString(v.key)
+  )
+  import Study.From
+  implicit private[study] val FromHandler = tryHandler[From](
+    { case BSONString(v) =>
+      v.split(' ') match {
+        case Array("scratch")   => Success(From.Scratch)
+        case Array("game", id)  => Success(From.Game(id))
+        case Array("study", id) => Success(From.Study(Study.Id(id)))
+        case Array("relay")     => Success(From.Relay(none))
+        case Array("relay", id) => Success(From.Relay(Study.Id(id).some))
+        case _                  => handlerBadValue(s"Invalid from $v")
+      }
+    },
+    x =>
+      BSONString(x match {
+        case From.Scratch   => "scratch"
+        case From.Game(id)  => s"game $id"
+        case From.Study(id) => s"study $id"
+        case From.Relay(id) => s"relay${id.fold("")(" " + _)}"
+      })
+  )
+  import Settings.UserSelection
+  implicit private[study] val UserSelectionHandler = tryHandler[UserSelection](
+    { case BSONString(v) => UserSelection.byKey get v toTry s"Invalid user selection $v" },
+    x => BSONString(x.key)
+  )
+  implicit val SettingsBSONHandler = new BSON[Settings] {
+    def reads(r: Reader) =
+      Settings(
+        computer = r.get[UserSelection]("computer"),
+        explorer = r.get[UserSelection]("explorer"),
+        cloneable = r.getO[UserSelection]("cloneable") | Settings.init.cloneable,
+        chat = r.getO[UserSelection]("chat") | Settings.init.chat,
+        sticky = r.getO[Boolean]("sticky") | Settings.init.sticky,
+        description = r.getO[Boolean]("description") | Settings.init.description
+      )
+    private val writer                 = Macros.writer[Settings]
+    def writes(w: Writer, s: Settings) = writer.writeTry(s).get
   }
 
   import Study.Likes
   implicit val LikesBSONHandler = intAnyValHandler[Likes](_.value, Likes.apply)
   import Study.Rank
-  private[study] implicit val RankBSONHandler = dateIsoHandler[Rank](Iso[DateTime, Rank](Rank.apply, _.value))
+  implicit private[study] val RankBSONHandler = dateIsoHandler[Rank](Iso[DateTime, Rank](Rank.apply, _.value))
 
+  // implicit val StudyBSONHandler = BSON.LoggingHandler(logger)(Macros.handler[Study])
   implicit val StudyBSONHandler = Macros.handler[Study]
 
   implicit val lightStudyBSONReader = new BSONDocumentReader[Study.LightStudy] {
-    def read(doc: BSONDocument) = Study.LightStudy(
-      isPublic = doc.getAs[String]("visibility") has "public",
-      contributors = doc.getAs[StudyMembers]("members").??(_.contributorIds)
-    )
+    def readDocument(doc: BSONDocument) =
+      Success(
+        Study.LightStudy(
+          isPublic = doc.string("visibility") has "public",
+          contributors = doc.getAsOpt[StudyMembers]("members").??(_.contributorIds)
+        )
+      )
+  }
+
+  implicit val ChapterMetadataBSONReader = new BSONDocumentReader[Chapter.Metadata] {
+    def readDocument(doc: Bdoc) = for {
+      id    <- doc.getAsTry[Chapter.Id]("_id")
+      name  <- doc.getAsTry[Chapter.Name]("name")
+      setup <- doc.getAsTry[Chapter.Setup]("setup")
+      resultColor = doc
+        .getAsOpt[List[String]]("tags")
+        .map {
+          _.headOption
+            .map(_ drop 7)
+            .filter("*" !=) map Color.fromResult
+        }
+      hasRelayPath = doc.getAsOpt[Bdoc]("relay").flatMap(_ string "path").exists(_.nonEmpty)
+    } yield Chapter.Metadata(id, name, setup, resultColor, hasRelayPath)
   }
 }

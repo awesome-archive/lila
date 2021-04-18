@@ -1,41 +1,45 @@
-import { h } from 'snabbdom'
-import { VNode } from 'snabbdom/vnode';
-import { standing } from './arena';
+import { h, VNode } from 'snabbdom';
+import { controls, standing } from './arena';
+import { teamStanding } from './battle';
 import header from './header';
-import tourSide from './side';
+import tourTable from './table';
 import playerInfo from './playerInfo';
-import { dataIcon } from './util';
+import teamInfo from './teamInfo';
 import * as pagination from '../pagination';
 import * as tour from '../tournament';
 import TournamentController from '../ctrl';
 import { MaybeVNodes } from '../interfaces';
 
 function joinTheGame(ctrl: TournamentController, gameId: string) {
-  return h('a.is.is-after.pov.button.glowed', {
-    attrs: { href: '/' + gameId }
-  }, [
-    ctrl.trans('youArePlaying'),
-    h('span.text', {
-      attrs: dataIcon('G')
-    }, ctrl.trans('joinTheGame'))
-  ]);
+  return h(
+    'a.tour__ur-playing.button.is.is-after',
+    {
+      attrs: { href: '/' + gameId },
+    },
+    [ctrl.trans('youArePlaying'), h('br'), ctrl.trans('joinTheGame')]
+  );
 }
 
 function notice(ctrl: TournamentController): VNode {
-  return tour.willBePaired(ctrl) ? h('div.notice.wait',
-    ctrl.trans('standByX', ctrl.data.me.username)
-  ) : h('div.notice.closed', ctrl.trans('tournamentPairingsAreNowClosed'));
+  return tour.willBePaired(ctrl)
+    ? h('div.tour__notice.bar-glider', ctrl.trans('standByX', ctrl.data.me.username))
+    : h('div.tour__notice.closed', ctrl.trans('tournamentPairingsAreNowClosed'));
 }
 
+export const name = 'started';
+
 export function main(ctrl: TournamentController): MaybeVNodes {
-  const gameId = ctrl.myGameId();
+  const gameId = ctrl.myGameId(),
+    pag = pagination.players(ctrl);
   return [
     header(ctrl),
-    gameId ? joinTheGame(ctrl, gameId) : (tour.isIn(ctrl) ? notice(ctrl) : null),
-    standing(ctrl, pagination.players(ctrl))
+    gameId ? joinTheGame(ctrl, gameId) : tour.isIn(ctrl) ? notice(ctrl) : null,
+    teamStanding(ctrl, 'started'),
+    controls(ctrl, pag),
+    standing(ctrl, pag, 'started'),
   ];
 }
 
-export function side(ctrl: TournamentController): MaybeVNodes {
-  return ctrl.playerInfo.id ? [playerInfo(ctrl)] : tourSide(ctrl);
+export function table(ctrl: TournamentController): VNode | undefined {
+  return ctrl.playerInfo.id ? playerInfo(ctrl) : ctrl.teamInfo.requested ? teamInfo(ctrl) : tourTable(ctrl);
 }

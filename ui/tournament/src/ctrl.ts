@@ -1,13 +1,18 @@
 import makeSocket from './socket';
-import xhr from './xhr';
+import * as xhr from './xhr';
 import { myPage, players } from './pagination';
 import * as sound from './sound';
 import * as tour from './tournament';
-import { TournamentData, TournamentOpts, Pages, PlayerInfo } from './interfaces';
+import { TournamentData, TournamentOpts, Pages, PlayerInfo, TeamInfo, Standing } from './interfaces';
+// eslint-disable-next-line no-duplicate-imports
 import { TournamentSocket } from './socket';
 
-export default class TournamentController {
+interface CtrlTeamInfo {
+  requested?: string;
+  loaded?: TeamInfo;
+}
 
+export default class TournamentController {
   opts: TournamentOpts;
   data: TournamentData;
   trans: Trans;
@@ -16,30 +21,31 @@ export default class TournamentController {
   pages: Pages = {};
   lastPageDisplayed: number | undefined;
   focusOnMe: boolean;
-  joinSpinner: boolean = false;
+  joinSpinner = false;
   playerInfo: PlayerInfo = {};
-  disableClicks: boolean = true;
-  searching: boolean = false;
+  teamInfo: CtrlTeamInfo = {};
+  disableClicks = true;
+  searching = false;
+  joinWithTeamSelector = false;
   redraw: () => void;
 
-  private watchingGameId: string;
-  private lastStorage = window.lichess.storage.make('last-redirect');
+  private lastStorage = lichess.storage.make('last-redirect');
 
   constructor(opts: TournamentOpts, redraw: () => void) {
     this.opts = opts;
     this.data = opts.data;
     this.redraw = redraw;
-    this.trans = window.lichess.trans(opts.i18n);
+    this.trans = lichess.trans(opts.i18n);
     this.socket = makeSocket(opts.socketSend, this);
     this.page = this.data.standing.page;
     this.focusOnMe = tour.isIn(this);
-    setTimeout(() => this.disableClicks = false, 1500);
+    setTimeout(() => (this.disableClicks = false), 1500);
     this.loadPage(this.data.standing);
     this.scrollToMe();
     sound.end(this.data);
     sound.countDown(this.data);
+    this.recountTeams();
     this.redirectToMyGame();
-    if (this.data.featured) this.startWatching(this.data.featured.id);
   }
 
   askReload = (): void => {
@@ -48,19 +54,26 @@ export default class TournamentController {
   };
 
   reload = (data: TournamentData): void => {
-    this.data = {...this.data, ...data};
-    if (data.playerInfo && data.playerInfo.player.id === this.playerInfo.id)
-      this.playerInfo.data = data.playerInfo;
+    // we joined a private tournament! Reload the page to load the chat
+    if (!this.data.me && data.me && this.data['private']) lichess.reload();
+    this.data = { ...this.data, ...data };
+    this.data.me = data.me; // to account for removal on withdraw
+    if (data.playerInfo && data.playerInfo.player.id === this.playerInfo.id) this.playerInfo.data = data.playerInfo;
     this.loadPage(data.standing);
     if (this.focusOnMe) this.scrollToMe();
-    if (data.featured) this.startWatching(data.featured.id);
     sound.end(data);
     sound.countDown(data);
     this.joinSpinner = false;
+    this.recountTeams();
     this.redirectToMyGame();
   };
 
-  myGameId = () => this.data.me && this.data.me.gameId;
+  myGameId = () => this.data.me?.gameId;
+
+  private recountTeams() {
+    if (this.data.teamBattle)
+      this.data.teamBattle.hasMoreThanTenTeams = Object.keys(this.data.teamBattle.teams).length > 10;
+  }
 
   private redirectToMyGame() {
     const gameId = this.myGameId();
@@ -68,33 +81,35 @@ export default class TournamentController {
   }
 
   redirectFirst = (gameId: string, rightNow?: boolean) => {
-    const delay = (rightNow || document.hasFocus()) ? 10 : (1000 + Math.random() * 500);
+    const delay = rightNow || document.hasFocus() ? 10 : 1000 + Math.random() * 500;
     setTimeout(() => {
       if (this.lastStorage.get() !== gameId) {
         this.lastStorage.set(gameId);
-        window.lichess.redirect('/' + gameId);
+        lichess.redirect('/' + gameId);
       }
     }, delay);
   };
 
-  loadPage = (data: TournamentData) => {
-    this.pages[data.page] = data.players;
-  }
+  loadPage = (data: Standing) => {
+    if (!data.failed || !this.pages[data.page]) this.pages[data.page] = data.players;
+  };
 
   setPage = (page: number) => {
     this.page = page;
     xhr.loadPage(this, page);
   };
 
-  jumpToPageOf = (userId: string) => {
+  jumpToPageOf = (name: string) => {
+    const userId = name.toLowerCase();
     xhr.loadPageOf(this, userId).then(data => {
       this.loadPage(data);
       this.page = data.page;
       this.searching = false;
+      this.focusOnMe = false;
       this.pages[this.page].filter(p => p.name.toLowerCase() == userId).forEach(this.showPlayerInfo);
       this.redraw();
     });
-  }
+  };
 
   userSetPage = (page: number) => {
     this.focusOnMe = false;
@@ -111,20 +126,18 @@ export default class TournamentController {
     this.focusOnMe = false;
   };
 
-  join = (password?: string) => {
+  join = (password?: string, team?: string) => {
+    this.joinWithTeamSelector = false;
     if (!this.data.verdicts.accepted)
-    return this.data.verdicts.list.forEach(function(v) {
-      if (v.verdict !== 'ok') alert(v.verdict);
-    });
-    xhr.join(this, password);
-    this.joinSpinner = true;
-    this.focusOnMe = true;
-  };
-
-  private startWatching(id: string) {
-    if (id !== this.watchingGameId) {
-      this.watchingGameId = id;
-      setTimeout(() => this.socket.send("startWatching", id), 1000);
+      return this.data.verdicts.list.forEach(v => {
+        if (v.verdict !== 'ok') alert(v.verdict);
+      });
+    if (this.data.teamBattle && !team && !this.data.me) {
+      this.joinWithTeamSelector = true;
+    } else {
+      xhr.join(this, password, team);
+      this.joinSpinner = true;
+      this.focusOnMe = true;
     }
   };
 
@@ -139,20 +152,34 @@ export default class TournamentController {
     if (this.focusOnMe) this.scrollToMe();
   };
 
-  showPlayerInfo = (player) => {
+  showPlayerInfo = player => {
+    if (this.data.secondsToStart) return;
     const userId = player.name.toLowerCase();
+    this.teamInfo.requested = undefined;
     this.playerInfo = {
       id: this.playerInfo.id === userId ? null : userId,
       player: player,
-      data: null
+      data: null,
     };
     if (this.playerInfo.id) xhr.playerInfo(this, this.playerInfo.id);
   };
 
-  setPlayerInfoData = (data) => {
-    if (data.player.id !== this.playerInfo.id) return;
-    this.playerInfo.data = data;
+  setPlayerInfoData = data => {
+    if (data.player.id === this.playerInfo.id) this.playerInfo.data = data;
   };
 
-  toggleSearch = () => this.searching = !this.searching;
+  showTeamInfo = (teamId: string) => {
+    this.playerInfo.id = undefined;
+    this.teamInfo = {
+      requested: this.teamInfo.requested === teamId ? undefined : teamId,
+      loaded: undefined,
+    };
+    if (this.teamInfo.requested) xhr.teamInfo(this, this.teamInfo.requested);
+  };
+
+  setTeamInfo = (teamInfo: TeamInfo) => {
+    if (teamInfo.id === this.teamInfo.requested) this.teamInfo.loaded = teamInfo;
+  };
+
+  toggleSearch = () => (this.searching = !this.searching);
 }

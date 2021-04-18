@@ -1,9 +1,12 @@
 package lila.oauth
 
+import io.lemonlabs.uri.AbsoluteUrl
 import org.joda.time.DateTime
 import play.api.data._
 import play.api.data.Forms._
-import play.api.data.validation.Constraints._
+import reactivemongo.api.bson.BSONObjectID
+
+import lila.common.Form.absoluteUrl
 
 object OAuthForm {
 
@@ -11,10 +14,12 @@ object OAuthForm {
 
   object token {
 
-    val form = Form(mapping(
-      "description" -> text(minLength = 3, maxLength = 140),
-      "scopes" -> scopesField
-    )(Data.apply)(Data.unapply))
+    val form = Form(
+      mapping(
+        "description" -> text(minLength = 3, maxLength = 140),
+        "scopes"      -> scopesField
+      )(Data.apply)(Data.unapply)
+    )
 
     def create = form
 
@@ -22,25 +27,29 @@ object OAuthForm {
         description: String,
         scopes: List[String]
     ) {
-      def make(user: lila.user.User) = AccessToken(
-        id = AccessToken.makeId,
-        clientId = PersonalToken.clientId,
-        userId = user.id,
-        createdAt = DateTime.now.some,
-        description = description.some,
-        scopes = scopes.flatMap(OAuthScope.byKey.get)
-      )
+      def make(user: lila.user.User) =
+        AccessToken(
+          id = AccessToken.makeId,
+          publicId = BSONObjectID.generate(),
+          clientId = PersonalToken.clientId,
+          userId = user.id,
+          createdAt = DateTime.now.some,
+          description = description.some,
+          scopes = scopes.flatMap(OAuthScope.byKey.get)
+        )
     }
   }
 
   object app {
 
-    val form = Form(mapping(
-      "name" -> text(minLength = 3, maxLength = 90),
-      "description" -> optional(nonEmptyText(maxLength = 400)),
-      "homepageUri" -> nonEmptyText,
-      "redirectUri" -> nonEmptyText
-    )(Data.apply)(Data.unapply))
+    val form = Form(
+      mapping(
+        "name"        -> text(minLength = 3, maxLength = 90),
+        "description" -> optional(nonEmptyText(maxLength = 400)),
+        "homepageUri" -> absoluteUrl,
+        "redirectUri" -> absoluteUrl
+      )(Data.apply)(Data.unapply)
+    )
 
     def create = form
 
@@ -49,36 +58,39 @@ object OAuthForm {
     case class Data(
         name: String,
         description: Option[String],
-        homepageUri: String,
-        redirectUri: String
+        homepageUri: AbsoluteUrl,
+        redirectUri: AbsoluteUrl
     ) {
-      def make(user: lila.user.User) = OAuthApp(
-        name = name,
-        description = description,
-        homepageUri = homepageUri,
-        redirectUri = redirectUri,
-        clientId = OAuthApp.makeId,
-        clientSecret = OAuthApp.makeSecret,
-        author = user.id,
-        createdAt = DateTime.now
-      )
+      def make(user: lila.user.User) =
+        OAuthApp(
+          name = name,
+          description = description,
+          homepageUri = homepageUri,
+          redirectUri = redirectUri,
+          clientId = OAuthApp.makeId,
+          clientSecret = OAuthApp.makeSecret,
+          author = user.id,
+          createdAt = DateTime.now
+        )
 
-      def update(app: OAuthApp) = app.copy(
-        name = name,
-        description = description,
-        homepageUri = homepageUri,
-        redirectUri = redirectUri
-      )
+      def update(app: OAuthApp) =
+        app.copy(
+          name = name,
+          description = description,
+          homepageUri = homepageUri,
+          redirectUri = redirectUri
+        )
     }
 
     object Data {
 
-      def make(app: OAuthApp) = Data(
-        name = app.name,
-        description = app.description,
-        homepageUri = app.homepageUri,
-        redirectUri = app.redirectUri
-      )
+      def make(app: OAuthApp) =
+        Data(
+          name = app.name,
+          description = app.description,
+          homepageUri = app.homepageUri,
+          redirectUri = app.redirectUri
+        )
     }
   }
 }

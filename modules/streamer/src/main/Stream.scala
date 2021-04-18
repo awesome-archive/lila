@@ -1,17 +1,24 @@
 package lila.streamer
 
 import play.api.libs.json._
+import org.joda.time.DateTime
 
 import lila.user.User
+import lila.common.String.html.unescapeHtml
 
 trait Stream {
   def serviceName: String
   val status: String
   val streamer: Streamer
-  def is(s: Streamer): Boolean = streamer.id == s.id
+  def is(s: Streamer): Boolean     = streamer.id == s.id
   def is(userId: User.ID): Boolean = streamer.userId == userId
-  def twitch = serviceName == "twitch"
-  def youTube = serviceName == "youTube"
+  def twitch                       = serviceName == "twitch"
+  def youTube                      = serviceName == "youTube"
+
+  lazy val lang: String = status match {
+    case Stream.LangRegex(code) => code.toLowerCase
+    case _                      => "en"
+  }
 }
 
 object Stream {
@@ -21,29 +28,21 @@ object Stream {
   }
 
   object Twitch {
-    case class Channel(name: String, status: Option[String])
-    case class TwitchStream(channel: Channel, stream_type: String) {
-      def isLive = stream_type == "live"
+    case class TwitchStream(user_name: String, title: String, `type`: String) {
+      def name   = user_name
+      def isLive = `type` == "live"
     }
-    case class Result(streams: Option[List[TwitchStream]]) {
-      def liveStreams = (~streams).filter(_.isLive)
-      def streams(keyword: Keyword, streamers: List[Streamer], alwaysFeatured: List[User.ID]): List[Stream] = liveStreams.map(_.channel).collect {
-        case Channel(name, Some(status)) =>
-          streamers.find { s =>
-            s.twitch.exists(_.userId.toLowerCase == name.toLowerCase) && {
-              status.toLowerCase.contains(keyword.toLowerCase) ||
-                alwaysFeatured.contains(s.userId)
-            }
-          } map { Stream(name, status, _) }
-      }.flatten
+    case class Pagination(cursor: Option[String])
+    case class Result(data: Option[List[TwitchStream]], pagination: Option[Pagination]) {
+      def liveStreams = (~data).filter(_.isLive)
     }
     case class Stream(userId: String, status: String, streamer: Streamer) extends lila.streamer.Stream {
       def serviceName = "twitch"
     }
     object Reads {
-      private implicit val twitchChannelReads = Json.reads[Channel]
-      private implicit val twitchStreamReads = Json.reads[TwitchStream]
-      implicit val twitchResultReads = Json.reads[Result]
+      implicit private val twitchStreamReads = Json.reads[TwitchStream]
+      implicit private val paginationReads   = Json.reads[Pagination]
+      implicit val twitchResultReads         = Json.reads[Result]
     }
   }
 
@@ -53,24 +52,36 @@ object Stream {
     case class Item(id: Id, snippet: Snippet)
     case class Result(items: List[Item]) {
       def streams(keyword: Keyword, streamers: List[Streamer]): List[Stream] =
-        items.filter { item =>
-          item.snippet.liveBroadcastContent == "live" &&
+        items
+          .withFilter { item =>
+            item.snippet.liveBroadcastContent == "live" &&
             item.snippet.title.toLowerCase.contains(keyword.toLowerCase)
-        }.flatMap { item =>
-          streamers.find(s => s.youTube.exists(_.channelId == item.snippet.channelId)) map {
-            Stream(item.snippet.channelId, item.snippet.title, item.id.videoId, _)
           }
-        }
+          .flatMap { item =>
+            streamers.find(s => s.youTube.exists(_.channelId == item.snippet.channelId)) map {
+              Stream(
+                item.snippet.channelId,
+                unescapeHtml(item.snippet.title),
+                item.id.videoId,
+                _
+              )
+            }
+          }
     }
-    case class Stream(channelId: String, status: String, videoId: String, streamer: Streamer) extends lila.streamer.Stream {
+    case class Stream(channelId: String, status: String, videoId: String, streamer: Streamer)
+        extends lila.streamer.Stream {
       def serviceName = "youTube"
     }
 
     object Reads {
-      private implicit val youtubeSnippetReads = Json.reads[Snippet]
-      private implicit val youtubeIdReads = Json.reads[Id]
-      private implicit val youtubeItemReads = Json.reads[Item]
-      implicit val youtubeResultReads = Json.reads[Result]
+      implicit private val youtubeSnippetReads = Json.reads[Snippet]
+      implicit private val youtubeIdReads      = Json.reads[Id]
+      implicit private val youtubeItemReads    = Json.reads[Item]
+      implicit val youtubeResultReads          = Json.reads[Result]
     }
+
+    case class StreamsFetched(list: List[YouTube.Stream], at: DateTime)
   }
+
+  private val LangRegex = """\[(\w\w)\]""".r.unanchored
 }

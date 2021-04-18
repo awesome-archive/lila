@@ -17,11 +17,11 @@ public class StringUtils {
             if (c >= ' ' && c <= '~') switch(c) {
                 case '<': case '>': case '&': case '"':
                 case '\'': case '\\': case '`':
-                    break;  // cur char is bad, escape it
+                    break; // cur char is bad, escape it
                 default:
-                    continue;  // char is OK, continue scan.
+                    continue; // char is ok, continue scan
             }
-            // this code runs when char is either out of alphanumeric range OR
+            // This code runs when char is either out of alphanumeric range OR
             // char is restricted.
             if (sb == null) {
               sb = new StringBuilder(c <= '~' ? len + 22 : len * 6 + 2);
@@ -42,21 +42,21 @@ public class StringUtils {
         return sb.toString();
     }
 
-    public static String escapeHtml(final String s) {
+    public static String escapeHtmlRaw(final String s) {
         final char[] sArr = s.toCharArray();
         for (int i = 0, end = sArr.length; i < end; i++) {
             switch (sArr[i]) {
                 case '<': case '>': case '&': case '"': case '\'':
                   final StringBuilder sb = new StringBuilder(end + 20);
                   sb.append(s, 0, i);
-                  escapeHtml(sb, sArr, i, end);
+                  escapeHtmlRaw(sb, sArr, i, end);
                   return sb.toString();
             }
         }
         return s;
     }
 
-    public static void escapeHtml(final StringBuilder sb, final char[] sArr,
+    public static void escapeHtmlRaw(final StringBuilder sb, final char[] sArr,
         int start, final int end) {
 
         for (int i = start; i < end; i++) {
@@ -74,6 +74,28 @@ public class StringUtils {
             }
         }
         sb.append(sArr, start, end - start);
+    }
+
+    public static String removeGarbageChars(final String s) {
+        final char[] sArr = s.toCharArray();
+        final int size = sArr.length;
+        final StringBuilder sb = new StringBuilder(size);
+        for (int i = 0; i < size; i++) {
+            final char c = sArr[i];
+            switch (c) {
+              case '\u200b':
+              case '\u200c':
+              case '\u200d':
+              case '\u200e':
+              case '\u200f':
+              case '\u202e':
+              case '\u1160': 
+                break;
+              default:
+                sb.append(c);
+            }
+        }
+        return sb.toString();
     }
 
     /**

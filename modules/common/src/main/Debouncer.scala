@@ -5,18 +5,18 @@ import scala.concurrent.duration._
 
 // do NOT embed me in an actor
 // for it would likely create a memory leak
-final class Debouncer[A: Manifest](length: FiniteDuration, function: A => Unit) extends Actor {
+final class Debouncer[A: Manifest](length: FiniteDuration, effect: A => Unit)(implicit
+    ec: scala.concurrent.ExecutionContext
+) extends Actor {
 
   private case object DelayEnd
 
   private var delayed: Option[A] = none
 
-  def ready: Receive = {
-
-    case a: A =>
-      function(a)
-      context.system.scheduler.scheduleOnce(length, self, DelayEnd)
-      context become delay
+  def ready: Receive = { case a: A =>
+    effect(a)
+    context.system.scheduler.scheduleOnce(length, self, DelayEnd)
+    context become delay
   }
 
   def delay: Receive = {

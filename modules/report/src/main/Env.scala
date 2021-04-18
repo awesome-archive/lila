@@ -1,79 +1,83 @@
 package lila.report
 
-import scala.concurrent.duration._
 import akka.actor._
-import com.typesafe.config.Config
+import com.softwaremill.macwire._
+import io.methvin.play.autoconfig._
+import play.api.Configuration
+import scala.concurrent.duration._
 
+import lila.common.config._
+
+@Module
+private class ReportConfig(
+    @ConfigName("collection.report") val reportColl: CollName,
+    @ConfigName("score.threshold") val scoreThreshold: Int,
+    @ConfigName("actor.name") val actorName: String
+)
+
+@Module
 final class Env(
-    config: Config,
-    db: lila.db.Env,
-    isOnline: lila.user.User.ID => Boolean,
-    noteApi: lila.user.NoteApi,
+    appConfig: Configuration,
+    domain: lila.common.config.NetDomain,
+    db: lila.db.Db,
+    isOnline: lila.socket.IsOnline,
+    userRepo: lila.user.UserRepo,
+    lightUserAsync: lila.common.LightUser.Getter,
+    gameRepo: lila.game.GameRepo,
     securityApi: lila.security.SecurityApi,
-    system: ActorSystem,
-    hub: lila.hub.Env,
+    userLoginsApi: lila.security.UserLoginsApi,
+    playbanApi: lila.playban.PlaybanApi,
+    discordApi: lila.irc.DiscordApi,
+    captcher: lila.hub.actors.Captcher,
+    fishnet: lila.hub.actors.Fishnet,
     settingStore: lila.memo.SettingStore.Builder,
-    asyncCache: lila.memo.AsyncCache.Builder
+    cacheApi: lila.memo.CacheApi
+)(implicit
+    ec: scala.concurrent.ExecutionContext,
+    system: ActorSystem
 ) {
 
-  private val CollectionReport = config getString "collection.report"
-  private val ActorName = config getString "actor.name"
-  private val ScoreThreshold = config getInt "score.threshold"
-  private val NetDomain = config getString "net.domain"
+  private val config = appConfig.get[ReportConfig]("report")(AutoConfig.loader)
 
-  val scoreThresholdSetting = settingStore[Int](
-    "reportScoreThreshold",
-    default = ScoreThreshold,
-    text = "Report score threshold. Reports with lower scores are concealed to moderators".some
+  private lazy val reportColl = db(config.reportColl)
+
+  lazy val scoreThresholdsSetting = ReportThresholds makeScoreSetting settingStore
+
+  lazy val discordScoreThresholdSetting = ReportThresholds makeDiscordSetting settingStore
+
+  private val thresholds = Thresholds(
+    score = scoreThresholdsSetting.get _,
+    discord = discordScoreThresholdSetting.get _
   )
 
-  lazy val forms = new DataForm(hub.captcher, NetDomain)
+  lazy val forms = wire[ReportForm]
 
-  private lazy val autoAnalysis = new AutoAnalysis(
-    fishnet = hub.fishnet,
-    system = system
-  )
+  private lazy val autoAnalysis = wire[AutoAnalysis]
 
-  lazy val api = new ReportApi(
-    reportColl,
-    autoAnalysis,
-    noteApi,
-    securityApi,
-    isOnline,
-    asyncCache,
-    scoreThreshold = scoreThresholdSetting.get
-  )
+  lazy val api = wire[ReportApi]
 
   lazy val modFilters = new ModReportFilter
 
   // api actor
-  system.actorOf(Props(new Actor {
-    def receive = {
-      case lila.hub.actorApi.report.Cheater(userId, text) =>
-        api.autoCheatReport(userId, text)
-      case lila.hub.actorApi.report.Shutup(userId, text) =>
-        api.autoInsultReport(userId, text)
-      case lila.hub.actorApi.report.Booster(winnerId, loserId) =>
-        api.autoBoostReport(winnerId, loserId)
-    }
-  }), name = ActorName)
-
-  system.scheduler.schedule(1 minute, 1 minute) { api.inquiries.expire }
-
-  lazy val reportColl = db(CollectionReport)
-}
-
-object Env {
-
-  lazy val current = "report" boot new Env(
-    config = lila.common.PlayApp loadConfig "report",
-    db = lila.db.Env.current,
-    isOnline = lila.user.Env.current.isOnline,
-    noteApi = lila.user.Env.current.noteApi,
-    securityApi = lila.security.Env.current.api,
-    system = lila.common.PlayApp.system,
-    hub = lila.hub.Env.current,
-    settingStore = lila.memo.Env.current.settingStore,
-    asyncCache = lila.memo.Env.current.asyncCache
+  system.actorOf(
+    Props(new Actor {
+      def receive = {
+        case lila.hub.actorApi.report.Cheater(userId, text) =>
+          api.autoCheatReport(userId, text).unit
+        case lila.hub.actorApi.report.Shutup(userId, text) =>
+          api.autoCommReport(userId, text).unit
+      }
+    }),
+    name = config.actorName
   )
+
+  lila.common.Bus.subscribeFun("playban", "autoFlag") {
+    case lila.hub.actorApi.playban.Playban(userId, _) => api.maybeAutoPlaybanReport(userId).unit
+    case lila.hub.actorApi.report.AutoFlag(suspectId, resource, text) =>
+      api.autoCommFlag(SuspectId(suspectId), resource, text).unit
+  }
+
+  system.scheduler.scheduleWithFixedDelay(1 minute, 1 minute) { () =>
+    api.inquiries.expire.unit
+  }
 }

@@ -1,9 +1,9 @@
-import { VNode } from 'snabbdom/vnode';
+import { VNode } from 'snabbdom';
 import { GameData, Status } from 'game';
 import { ClockData, Seconds, Centis } from './clock/clockCtrl';
 import { CorresClockData } from './corresClock/corresClockCtrl';
-import { TourPlayer } from './tourStanding';
-import { ChatPlugin } from 'chat';
+import RoundController from './ctrl';
+import { ChatCtrl, ChatPlugin } from 'chat';
 import * as cg from 'chessground/types';
 
 export type MaybeVNode = VNode | null | undefined;
@@ -15,7 +15,12 @@ export interface Untyped {
   [key: string]: any;
 }
 
+export interface NvuiPlugin {
+  render(ctrl: RoundController): VNode;
+}
+
 export interface SocketOpts {
+  sign: string;
   ackable: boolean;
   withLag?: boolean;
   millis?: number;
@@ -31,12 +36,12 @@ export interface SocketDrop {
   b?: 1;
 }
 
-export type EncodedDests = string | {
-  [key: string]: string;
-};
-export interface DecodedDests {
-  [key: string]: cg.Key[];
-}
+export type EncodedDests =
+  | string
+  | {
+      [key: string]: string;
+    };
+export type Dests = cg.Dests;
 
 export interface RoundData extends GameData {
   clock?: ClockData;
@@ -50,8 +55,7 @@ export interface RoundData extends GameData {
   url: {
     socket: string;
     round: string;
-  },
-  blind?: boolean;
+  };
   tv?: Tv;
   userTv?: {
     id: string;
@@ -71,10 +75,7 @@ export interface Tv {
 }
 
 interface CrazyData {
-  pockets: {
-    white: CrazyPocket;
-    black: CrazyPocket;
-  };
+  pockets: [CrazyPocket, CrazyPocket];
 }
 
 interface CrazyPocket {
@@ -88,16 +89,19 @@ export interface RoundOpts {
   onChange(d: RoundData): void;
   element: HTMLElement;
   crosstableEl: HTMLElement;
-  i18n: any;
-  chat?: Chat;
-  tour?: TourPlayer[];
+  i18n: I18nDict;
+  chat?: ChatOpts;
 }
 
-export interface Chat {
+export interface ChatOpts {
   preset: 'start' | 'end' | undefined;
   parseMoves?: boolean;
   plugin?: ChatPlugin;
   alwaysEnabled: boolean;
+  noteId?: string;
+  noteAge?: number;
+  noteText?: string;
+  instance?: Promise<ChatCtrl>;
 }
 
 export interface Step {
@@ -115,7 +119,7 @@ export interface ApiMove extends Step {
     white: Seconds;
     black: Seconds;
     lag?: Centis;
-  }
+  };
   status: Status;
   winner?: Color;
   check: boolean;
@@ -129,11 +133,11 @@ export interface ApiMove extends Step {
     key: cg.Key;
     pieceClass: cg.Role;
   };
-  enpassant: {
+  enpassant?: {
     key: cg.Key;
     color: Color;
   };
-  castle: {
+  castle?: {
     king: [cg.Key, cg.Key];
     rook: [cg.Key, cg.Key];
     color: Color;
@@ -153,11 +157,10 @@ export interface ApiEnd {
   clock?: {
     wc: Centis;
     bc: Centis;
-  }
+  };
 }
 
-export interface StepCrazy extends Untyped {
-}
+export interface StepCrazy extends Untyped {}
 
 export interface Pref {
   animationDuration: number;
@@ -178,6 +181,7 @@ export interface Pref {
   rookCastle: boolean;
   showCaptured: boolean;
   submitMove: boolean;
+  resizeHandle: 0 | 1 | 2;
 }
 
 export interface MoveMetadata {
@@ -194,4 +198,8 @@ export interface MaterialDiffSide {
 export interface MaterialDiff {
   white: MaterialDiffSide;
   black: MaterialDiffSide;
+}
+export interface CheckCount {
+  white: number;
+  black: number;
 }

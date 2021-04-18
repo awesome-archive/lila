@@ -1,27 +1,29 @@
 package lila.tv
 
-import akka.actor._
 import akka.pattern.{ ask => actorAsk }
 import play.api.libs.json.Json
 import scala.concurrent.duration._
 import scala.concurrent.Promise
 
-import lila.common.LightUser
-import lila.game.{ Game, GameRepo }
+import lila.common.{ Bus, LightUser }
+import lila.game.{ Game, Pov }
 import lila.hub.Trouper
 
-private[tv] final class TvTrouper(
-    system: ActorSystem,
-    rendererActor: ActorSelection,
-    selectChannel: lila.socket.Channel,
-    lightUser: LightUser.GetterSync,
-    onSelect: Game => Unit
-) extends Trouper {
+final private[tv] class TvTrouper(
+    renderer: lila.hub.actors.Renderer,
+    lightUserSync: LightUser.GetterSync,
+    recentTvGames: lila.round.RecentTvGames,
+    gameProxyRepo: lila.round.GameProxyRepo,
+    rematches: lila.game.Rematches
+)(implicit ec: scala.concurrent.ExecutionContext)
+    extends Trouper {
 
   import TvTrouper._
 
-  private val channelTroupers: Map[Tv.Channel, Trouper] = Tv.Channel.all.map { c =>
-    c -> new ChannelTrouper(c, lightUser, onSelect = this.!)
+  Bus.subscribe(this, "startGame")
+
+  private val channelTroupers: Map[Tv.Channel, ChannelTrouper] = Tv.Channel.all.map { c =>
+    c -> new ChannelTrouper(c, onSelect = this.!, gameProxyRepo.game, rematches.of, lightUserSync)
   }.toMap
 
   private var channelChampions = Map[Tv.Channel, Tv.Champion]()
@@ -42,48 +44,56 @@ private[tv] final class TvTrouper(
 
     case GetChampions(promise) => promise success Tv.Champions(channelChampions)
 
-    case Select =>
-      GameRepo.featuredCandidates map (_ map Tv.toCandidate(lightUser)) foreach { candidates =>
-        channelTroupers foreach {
-          case (channel, trouper) => trouper ! ChannelTrouper.Select {
-            candidates filter channel.filter map (_.game)
-          }
-        }
+    case lila.game.actorApi.StartGame(g) =>
+      if (g.hasClock) {
+        val candidate = Tv.toCandidate(lightUserSync)(g)
+        channelTroupers collect {
+          case (chan, trouper) if chan filter candidate => trouper
+        } foreach (_ addCandidate g)
       }
+
+    case s @ TvTrouper.Select => channelTroupers.foreach(_._2 ! s)
 
     case Selected(channel, game) =>
       import lila.socket.Socket.makeMessage
-      val player = game.firstPlayer
-      val user = player.userId flatMap lightUser
-      (user |@| player.rating) apply {
-        case (u, r) => channelChampions += (channel -> Tv.Champion(u, r, game.id))
+      import cats.implicits._
+      val player = game.players.sortBy { p =>
+        ~p.rating + ~p.userId.flatMap(lightUserSync).flatMap(_.title).flatMap(Tv.titleScores.get)
+      }.lastOption | game.player(game.naturalOrientation)
+      val user = player.userId flatMap lightUserSync
+      (user, player.rating) mapN { (u, r) =>
+        channelChampions += (channel -> Tv.Champion(u, r, game.id))
       }
-      onSelect(game)
-      selectChannel ! lila.socket.Channel.Publish(makeMessage("tvSelect", Json.obj(
+      recentTvGames.put(game)
+      val data = Json.obj(
         "channel" -> channel.key,
-        "id" -> game.id,
-        "color" -> game.firstColor.name,
+        "id"      -> game.id,
+        "color"   -> game.naturalOrientation.name,
         "player" -> user.map { u =>
           Json.obj(
-            "name" -> u.name,
-            "title" -> u.title,
+            "name"   -> u.name,
+            "title"  -> u.title,
             "rating" -> player.rating
           )
         }
-      )))
+      )
+      Bus.publish(lila.hub.actorApi.tv.TvSelect(game.id, game.speed, data), "tvSelect")
       if (channel == Tv.Channel.Best) {
         implicit def timeout = makeTimeout(100 millis)
-        actorAsk(rendererActor, actorApi.RenderFeaturedJs(game)) onSuccess {
-          case html: String =>
-            val event = lila.hub.actorApi.game.ChangeFeatured(
-              game.id,
-              makeMessage("featured", Json.obj(
-                "html" -> html,
-                "color" -> game.firstColor.name,
-                "id" -> game.id
-              ))
+        actorAsk(renderer.actor, actorApi.RenderFeaturedJs(game)) foreach { case html: String =>
+          val pov = Pov naturalOrientation game
+          val event = lila.round.ChangeFeatured(
+            pov,
+            makeMessage(
+              "featured",
+              Json.obj(
+                "html"  -> html,
+                "color" -> pov.color.name,
+                "id"    -> game.id
+              )
             )
-            system.lilaBus.publish(event, 'changeFeaturedGame)
+          )
+          Bus.publish(event, "changeFeaturedGame")
         }
       }
   }

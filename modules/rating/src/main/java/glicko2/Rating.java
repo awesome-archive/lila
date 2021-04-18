@@ -6,6 +6,8 @@
  */
 package org.goochjs.glicko2;
 
+import org.joda.time.DateTime;
+
 /**
  * Holds an individual's Glicko-2 rating.
  *
@@ -21,6 +23,7 @@ public class Rating {
 	private double ratingDeviation;
 	private double volatility;
 	private int numberOfResults; // the number of results from which the rating has been calculated
+	private final DateTime lastRatingPeriodEndDate;
 
 	 // the following variables are used to hold values temporarily whilst running calculations
 	private double workingRating;
@@ -28,15 +31,20 @@ public class Rating {
 	private double workingVolatility;
 
 	public Rating(double initRating, double initRatingDeviation, double initVolatility, int nbResults) {
+		this(initRating, initRatingDeviation, initVolatility, nbResults, null);
+	}
+
+	public Rating(double initRating, double initRatingDeviation, double initVolatility, int nbResults, DateTime lastRatingPeriodEndDate) {
 		this.rating = initRating;
 		this.ratingDeviation = initRatingDeviation;
 		this.volatility = initVolatility;
-    this.numberOfResults = nbResults;
+		this.numberOfResults = nbResults;
+		this.lastRatingPeriodEndDate = lastRatingPeriodEndDate;
 	}
 
 	/**
 	 * Return the average skill value of the player.
-	 * 
+	 *
 	 * @return double
 	 */
 	public double getRating() {
@@ -50,7 +58,7 @@ public class Rating {
 	/**
 	 * Return the average skill value of the player scaled down
 	 * to the scale used by the algorithm's internal workings.
-	 * 
+	 *
 	 * @return double
 	 */
 	public double getGlicko2Rating() {
@@ -59,7 +67,7 @@ public class Rating {
 
 	/**
 	 * Set the average skill value, taking in a value in Glicko2 scale.
-	 * 
+	 *
 	 * @param double
 	 */
 	public void setGlicko2Rating(double rating) {
@@ -82,10 +90,14 @@ public class Rating {
 		this.ratingDeviation = ratingDeviation;
 	}
 
+	public DateTime getLastRatingPeriodEndDate() {
+		return lastRatingPeriodEndDate;
+	}
+
 	/**
 	 * Return the rating deviation of the player scaled down
 	 * to the scale used by the algorithm's internal workings.
-	 * 
+	 *
 	 * @return double
 	 */
 	public double getGlicko2RatingDeviation() {
@@ -94,7 +106,7 @@ public class Rating {
 
 	/**
 	 * Set the rating deviation, taking in a value in Glicko2 scale.
-	 * 
+	 *
 	 * @param double
 	 */
 	public void setGlicko2RatingDeviation(double ratingDeviation) {
@@ -103,21 +115,21 @@ public class Rating {
 
 	/**
 	 * Used by the calculation engine, to move interim calculations into their "proper" places.
-	 * 
+	 *
 	 */
 	public void finaliseRating() {
 		this.setGlicko2Rating(workingRating);
 		this.setGlicko2RatingDeviation(workingRatingDeviation);
 		this.setVolatility(workingVolatility);
-		
+
 		this.setWorkingRatingDeviation(0);
 		this.setWorkingRating(0);
 		this.setWorkingVolatility(0);
 	}
-	
+
 	/**
 	 * Returns a formatted rating for inspection
-	 * 
+	 *
 	 * @return {ratingDeviation} / {volatility} / {numberOfResults}
 	 */
 	@Override
@@ -127,7 +139,7 @@ public class Rating {
 				volatility + " / " +
 				numberOfResults;
 	}
-	
+
 	public int getNumberOfResults() {
 		return numberOfResults;
 	}

@@ -3,8 +3,8 @@ package lila.pool
 import akka.actor._
 
 import lila.game.Game
-import lila.rating.RatingRange
-import lila.socket.Socket.{ Uid, Uids }
+import lila.rating.{ PerfType, RatingRange }
+import lila.socket.Socket.{ Sri, Sris }
 import lila.user.User
 
 final class PoolApi(
@@ -25,21 +25,25 @@ final class PoolApi(
     )
   }.toMap
 
-  def join(poolId: PoolConfig.Id, joiner: Joiner) =
-    playbanApi.hasCurrentBan(joiner.userId) foreach {
-      case false => actors foreach {
-        case (id, actor) if id == poolId => actor ! Join(joiner)
-        case (_, actor) => actor ! Leave(joiner.userId)
-      }
+  val poolPerfTypes: Map[PoolConfig.Id, PerfType] =
+    configs.map { config =>
+      config.id -> config.perfType
+    }.toMap
+
+  def join(poolId: PoolConfig.Id, joiner: Joiner): Unit =
+    playbanApi.hasCurrentBan(joiner.userId) dforeach {
+      case false =>
+        actors foreach {
+          case (id, actor) if id == poolId =>
+            playbanApi.getRageSit(joiner.userId).dforeach(actor ! Join(joiner, _))
+          case (_, actor) => actor ! Leave(joiner.userId)
+        }
       case _ =>
     }
 
   def leave(poolId: PoolConfig.Id, userId: User.ID) = sendTo(poolId, Leave(userId))
 
-  def socketIds(ids: Set[Uid]) = {
-    val msg = Uids(ids)
-    actors.values.foreach(_ ! msg)
-  }
+  def socketIds(ids: Sris) = actors.values.foreach(_ ! ids)
 
   private def sendTo(poolId: PoolConfig.Id, msg: Any) =
     actors get poolId foreach { _ ! msg }
@@ -49,15 +53,18 @@ object PoolApi {
 
   case class Joiner(
       userId: User.ID,
-      uid: Uid,
-      ratingMap: Map[String, Int],
+      sri: Sri,
+      rating: Int,
       ratingRange: Option[RatingRange],
       lame: Boolean,
-      blocking: Set[String]
+      blocking: Set[User.ID]
   ) {
 
     def is(member: PoolMember) = userId == member.userId
   }
 
-  case class Pairing(game: Game, whiteUid: Uid, blackUid: Uid)
+  case class Pairing(game: Game, whiteSri: Sri, blackSri: Sri) {
+    def sri(color: chess.Color) = color.fold(whiteSri, blackSri)
+  }
+  case class Pairings(pairings: List[Pairing])
 }

@@ -1,42 +1,28 @@
 package lila.playban
 
-import com.typesafe.config.Config
+import com.softwaremill.macwire._
+import play.api.Configuration
 
+import lila.common.config.CollName
+
+@Module
 final class Env(
-    config: Config,
-    messenger: lila.message.MessageApi,
+    appConfig: Configuration,
+    messenger: lila.msg.MsgApi,
+    reporter: lila.hub.actors.Report,
     chatApi: lila.chat.ChatApi,
+    userRepo: lila.user.UserRepo,
+    noteApi: lila.user.NoteApi,
     lightUser: lila.common.LightUser.Getter,
-    bus: lila.common.Bus,
-    db: lila.db.Env
-) {
+    db: lila.db.Db,
+    cacheApi: lila.memo.CacheApi
+)(implicit ec: scala.concurrent.ExecutionContext) {
 
-  private val settings = new {
-    val CollectionPlayban = config getString "collection.playban"
-  }
-  import settings._
-
-  private lazy val feedback = new PlaybanFeedback(
-    chatApi = chatApi,
-    lightUser = lightUser
+  private lazy val playbanColl = db(
+    CollName(appConfig.get[String]("playban.collection.playban"))
   )
 
-  lazy val api = new PlaybanApi(
-    coll = db(CollectionPlayban),
-    sandbag = new SandbagWatch(messenger),
-    feedback = feedback,
-    bus = bus
-  )
-}
+  private lazy val feedback = wire[PlaybanFeedback]
 
-object Env {
-
-  lazy val current: Env = "playban" boot new Env(
-    config = lila.common.PlayApp loadConfig "playban",
-    messenger = lila.message.Env.current.api,
-    chatApi = lila.chat.Env.current.api,
-    lightUser = lila.user.Env.current.lightUserApi.async,
-    bus = lila.common.PlayApp.system.lilaBus,
-    db = lila.db.Env.current
-  )
+  lazy val api = wire[PlaybanApi]
 }

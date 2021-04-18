@@ -1,149 +1,177 @@
 package views.html.setup
 
+import controllers.routes
 import play.api.data.Form
 import play.api.mvc.Call
-import play.twirl.api.Html
 
 import lila.api.Context
 import lila.app.templating.Environment._
 import lila.app.ui.ScalatagsTemplate._
-import lila.rating.RatingRange
-import lila.setup.{ FriendConfig, HookConfig }
 import lila.user.User
-
-import controllers.routes
 
 object forms {
 
   import bits._
 
-  def hook(form: Form[_])(implicit ctx: Context) = layout(
-    form,
-    "hook",
-    trans.createAGame.frag(),
-    routes.Setup.hook("uid-placeholder")
-  ) {
+  def hook(form: Form[_])(implicit ctx: Context) =
+    layout(
+      "hook",
+      trans.createAGame(),
+      routes.Setup.hook("sri-placeholder")
+    ) {
       frag(
         renderVariant(form, translatedVariantChoicesWithVariants),
-        renderTimeMode(form, lila.setup.HookConfig),
+        renderTimeMode(form, allowAnon = false),
         ctx.isAuth option frag(
           div(cls := "mode_choice buttons")(
             renderRadios(form("mode"), translatedModeChoices)
           ),
-          div(cls := "optional_config")(
-            div(cls := "rating_range_config slider")(
+          ctx.noBlind option div(cls := "optional_config")(
+            div(cls := "rating-range-config")(
               trans.ratingRange(),
-              ": ",
-              span(cls := "range")("? - ?"),
-              div(cls := "rating_range")(
-                renderInput(form("ratingRange"))(
-                  `type` := "hidden",
-                  dataMin := RatingRange.min,
-                  dataMax := RatingRange.max
+              div(cls := "rating-range") {
+                val field = form("ratingRange")
+                frag(
+                  renderInput(field),
+                  input(
+                    name := s"${field.name}_range_min",
+                    tpe := "range",
+                    cls := "range rating-range__min"
+                  ),
+                  span(cls := "rating-min"),
+                  "/",
+                  span(cls := "rating-max"),
+                  input(
+                    name := s"${field.name}_range_max",
+                    tpe := "range",
+                    cls := "range rating-range__max"
+                  )
                 )
-              )
+              }
             )
           )
         )
       )
     }
 
-  def ai(form: Form[_], ratings: Map[Int, Int], validFen: Option[lila.setup.ValidFen])(implicit ctx: Context) =
-    layout(form, "ai", trans.playWithTheMachine(), routes.Setup.ai) {
+  def ai(form: Form[_], ratings: Map[Int, Int], validFen: Option[lila.setup.ValidFen])(implicit
+      ctx: Context
+  ) =
+    layout("ai", trans.playWithTheMachine(), routes.Setup.ai) {
       frag(
         renderVariant(form, translatedAiVariantChoices),
-        fenInput(form("fen"), true, validFen),
-        renderTimeMode(form, lila.setup.AiConfig),
-        trans.level(),
-        div(cls := "level buttons")(
-          div(id := "config_level")(
-            renderRadios(form("level"), lila.setup.AiConfig.levelChoices)
-          ),
-          div(cls := "ai_info")(
-            ratings.toList.map {
-              case (level, rating) => div(cls := s"level_$level")(trans.aiNameLevelAiLevel("A.I.", level))
-            }
+        fenInput(form("fen"), strict = true, validFen),
+        renderTimeMode(form, allowAnon = true),
+        if (ctx.blind)
+          frag(
+            renderLabel(form("level"), trans.strength()),
+            renderSelect(form("level"), lila.setup.AiConfig.levelChoices),
+            blindSideChoice(form)
           )
-        )
+        else
+          frag(
+            br,
+            trans.strength(),
+            div(cls := "level buttons")(
+              div(id := "config_level")(
+                renderRadios(form("level"), lila.setup.AiConfig.levelChoices)
+              ),
+              div(cls := "ai_info")(
+                ratings.toList.map { case (level, _) =>
+                  div(cls := s"${prefix}level_$level")(trans.aiNameLevelAiLevel("Stockfish 13", level))
+                }
+              )
+            )
+          )
       )
     }
 
   def friend(
-    form: Form[_],
-    user: Option[User],
-    error: Option[String],
-    validFen: Option[lila.setup.ValidFen]
+      form: Form[_],
+      user: Option[User],
+      error: Option[String],
+      validFen: Option[lila.setup.ValidFen]
   )(implicit ctx: Context) =
     layout(
-      form,
       "friend",
-      (if (user.isDefined) trans.challengeToPlay else trans.playWithAFriend)(),
+      (if (user.isDefined) trans.challenge.challengeToPlay else trans.playWithAFriend)(),
       routes.Setup.friend(user map (_.id)),
-      error.map(e => Html(e.replace("{{user}}", userIdLink(user.map(_.id)).toString)))
-    )(frag(
+      error.map(e => raw(e.replace("{{user}}", userIdLink(user.map(_.id)).toString)))
+    )(
+      frag(
         user.map { u =>
           userLink(u, cssClass = "target".some)
         },
         renderVariant(form, translatedVariantChoicesWithVariantsAndFen),
-        fenInput(form("fen"), false, validFen),
-        renderTimeMode(form, lila.setup.FriendConfig),
+        fenInput(form("fen"), strict = false, validFen),
+        renderTimeMode(form, allowAnon = true),
         ctx.isAuth option div(cls := "mode_choice buttons")(
           renderRadios(form("mode"), translatedModeChoices)
-        )
-      ))
+        ),
+        blindSideChoice(form)
+      )
+    )
+
+  private def blindSideChoice(form: Form[_])(implicit ctx: Context) =
+    ctx.blind option frag(
+      renderLabel(form("color"), trans.side()),
+      renderSelect(form("color").copy(value = "random".some), translatedSideChoices)
+    )
 
   private def layout(
-    form: Form[_],
-    typ: String,
-    title: Frag,
-    route: Call,
-    error: Option[Frag] = None
+      typ: String,
+      titleF: Frag,
+      route: Call,
+      error: Option[Frag] = None
   )(fields: Frag)(implicit ctx: Context) =
-    div(
-      cls := s"""lichess_overboard game_config${error.isDefined ?? " error"}""",
-      dataRandomColorVariants,
-      dataType := typ,
-      dataAnon := ctx.isAnon.option("1")
-    )(
-        a(href := routes.Lobby.home, cls := "close icon", st.title := trans.cancel.txt(), dataIcon := "L"),
-        h2(title),
-        error.map { e =>
+    div(cls := error.isDefined option "error")(
+      h2(titleF),
+      error
+        .map { e =>
           frag(
             p(cls := "error")(e),
             br,
             a(href := routes.Lobby.home, cls := "button text", dataIcon := "L")(trans.cancel.txt())
           )
-        }.getOrElse {
-          st.form(action := route, method := "post", novalidate := true)(
+        }
+        .getOrElse {
+          postForm(
+            action := route,
+            novalidate,
+            dataRandomColorVariants,
+            dataType := typ,
+            dataAnon := ctx.isAnon.option("1")
+          )(
             fields,
-            div(cls := "color_submits")(
-              List(
-                "black" -> trans.black.txt(),
-                "random" -> trans.randomColor.txt(),
-                "white" -> trans.white.txt()
-              ).map {
-                  case (key, name) => button(
-                    disabled := typ == "hook" option true,
-                    `type` := "submit",
-                    dataHint := name,
-                    cls := s"button hint--bottom $key",
-                    st.name := form("color").id,
+            if (ctx.blind) submitButton("Create the game")
+            else
+              div(cls := "color-submits")(
+                translatedSideChoices.map { case (key, name, _) =>
+                  submitButton(
+                    (typ == "hook") option disabled,
+                    title := name,
+                    cls := s"color-submits__button button button-metal $key",
+                    st.name := "color",
                     value := key
                   )(i)
                 }
-            )
+              )
           )
         },
-        ctx.me.map { me =>
-          div(cls := "ratings")(
-            lila.rating.PerfType.nonPuzzle.map { perfType =>
-              div(cls := perfType.key)(
-                trans.perfRatingX.frag(
-                  Html(s"""<strong data-icon="${perfType.iconChar}">${me.perfs(perfType.key).map(_.intRating).getOrElse("?")}</strong> ${perfType.name}""")
-                )
+      ctx.me.ifFalse(ctx.blind).map { me =>
+        div(cls := "ratings")(
+          form3.hidden("rating", "?"),
+          lila.rating.PerfType.nonPuzzle.map { perfType =>
+            div(cls := perfType.key)(
+              trans.perfRatingX(
+                raw(s"""<strong data-icon="${perfType.iconChar}">${me
+                  .perfs(perfType.key)
+                  .map(_.intRating)
+                  .getOrElse("?")}</strong> ${perfType.trans}""")
               )
-            }
-          )
-        }
-      )
+            )
+          }
+        )
+      }
+    )
 }

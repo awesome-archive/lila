@@ -16,7 +16,7 @@
 # GNU General Public License for more details.
 #
 # You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import os.path
 import subprocess
@@ -60,7 +60,7 @@ def main(args):
         print("    // {} -> {}".format(arg, locale), file=sys.stderr)
 
         with open(arg) as f:
-            js = postprocess(uglifyjs(preprocess(f.read())))
+            js = postprocess(terser(preprocess(f.read())))
             print('''    "{}" -> """{}"""'''.format(locale, js), end="")
 
     print()
@@ -70,20 +70,20 @@ def main(args):
     return 0
 
 
-def preprocess(js):
-    return js.replace("export default ", "module.exports=")
-
-
-def uglifyjs(js):
-    p = subprocess.Popen(["uglifyjs", "--compress", "--mangle"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=sys.stderr)
+def terser(js):
+    p = subprocess.Popen(["yarn", "run", "--silent", "terser", "--mangle", "--compress"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=sys.stderr)
     stdout, stderr = p.communicate(js.encode("utf-8"))
     if p.returncode != 0:
         sys.exit(p.returncode)
     return stdout.decode("utf-8")
 
 
+def preprocess(js):
+    return js.replace("export default function", "lichess.timeagoLocale=function");
+
 def postprocess(js):
-    return "(function(){" + js.replace("module.exports=", "lichess.timeagoLocale=") + "})()"
+    return "(function(){" + js.strip() + "})()"
+
 
 
 if __name__ == '__main__':

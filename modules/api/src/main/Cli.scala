@@ -1,65 +1,91 @@
 package lila.api
 
-import akka.actor.ActorSelection
+import lila.common.Bus
 
-import lila.hub.actorApi.Deploy
-
-private[api] final class Cli(bus: lila.common.Bus) extends lila.common.Cli {
+final private[api] class Cli(
+    userRepo: lila.user.UserRepo,
+    security: lila.security.Env,
+    teamSearch: lila.teamSearch.Env,
+    forumSearch: lila.forumSearch.Env,
+    team: lila.team.Env,
+    puzzle: lila.puzzle.Env,
+    tournament: lila.tournament.Env,
+    explorer: lila.explorer.Env,
+    fishnet: lila.fishnet.Env,
+    study: lila.study.Env,
+    studySearch: lila.studySearch.Env,
+    coach: lila.coach.Env,
+    evalCache: lila.evalCache.Env,
+    plan: lila.plan.Env,
+    msg: lila.msg.Env,
+    slackApi: lila.irc.SlackApi
+)(implicit ec: scala.concurrent.ExecutionContext)
+    extends lila.common.Cli {
 
   private val logger = lila.log("cli")
 
-  def apply(args: List[String]): Fu[String] = run(args).map(_ + "\n") ~ {
-    _.logFailure(logger, _ => args mkString " ") foreach { output =>
-      logger.info("%s\n%s".format(args mkString " ", output))
+  def apply(args: List[String]): Fu[String] =
+    run(args).dmap(_ + "\n") ~ {
+      _.logFailure(logger, _ => args mkString " ") foreach { output =>
+        logger.info("%s\n%s".format(args mkString " ", output))
+      }
     }
-  }
 
   def process = {
-    case "uptime" :: Nil => fuccess(lila.common.PlayApp.uptime.toStandardSeconds.getSeconds.toString)
-    case "deploy" :: "pre" :: Nil => remindDeploy(lila.hub.actorApi.DeployPre)
-    case "deploy" :: "post" :: Nil => remindDeploy(lila.hub.actorApi.DeployPost)
+    case "uptime" :: Nil => fuccess(s"${lila.common.Uptime.seconds} seconds")
     case "change" :: ("asset" | "assets") :: "version" :: Nil =>
       import lila.common.AssetVersion
-      AssetVersion.change
+      AssetVersion.change()
       fuccess(s"Changed to ${AssetVersion.current}")
     case "gdpr" :: "erase" :: username :: "forever" :: Nil =>
-      lila.user.UserRepo named username flatMap {
-        case None => fuccess("No such user.")
-        case Some(user) if user.enabled => fuccess("That user account is not closed. Can't erase.")
-        case Some(user) => lila.user.UserRepo.email(user.id) map {
-          case Some(email) if email.value.toLowerCase == s"${user.id}@erase.forever" =>
-            bus.publish(lila.user.User.GDPRErase(user), 'gdprErase)
-            s"Erasing all data about ${user.username} now"
-          case _ => s"The user email must be set to <username>@erase.forever for erasing to start."
-        }
+      userRepo named username map {
+        case None                       => "No such user."
+        case Some(user) if user.enabled => "That user account is not closed. Can't erase."
+        case Some(user) =>
+          slackApi.gdprErase(user)
+          userRepo setEraseAt user
+          Bus.publish(lila.user.User.GDPRErase(user), "gdprErase")
+          s"Erasing all search data about ${user.username} now"
       }
-  }
-
-  private def remindDeploy(event: Deploy): Fu[String] = {
-    bus.publish(event, 'deploy)
-    fuccess("Deploy in progress")
+    case "announce" :: "cancel" :: Nil =>
+      AnnounceStore set none
+      Bus.publish(AnnounceStore.cancel, "announce")
+      fuccess("Removed announce")
+    case "announce" :: msgWords =>
+      AnnounceStore.set(msgWords mkString " ") match {
+        case Some(announce) =>
+          Bus.publish(announce, "announce")
+          fuccess(announce.json.toString)
+        case None =>
+          fuccess(
+            "Invalid announce. Format: `announce <length> <unit> <words...>` or just `announce cancel` to cancel it"
+          )
+      }
+    case "bus" :: "dump" :: Nil =>
+      val keys = Bus.keys
+      fuccess(s"${keys.size}\n ${keys mkString "\n"}")
   }
 
   private def run(args: List[String]): Fu[String] = {
     (processors lift args) | fufail("Unknown command: " + args.mkString(" "))
-  } recover {
-    case e: Exception => "ERROR " + e
+  } recover { case e: Exception =>
+    "ERROR " + e
   }
 
   private def processors =
-    lila.security.Env.current.cli.process orElse
-      lila.i18n.Env.current.cli.process orElse
-      lila.teamSearch.Env.current.cli.process orElse
-      lila.forumSearch.Env.current.cli.process orElse
-      lila.team.Env.current.cli.process orElse
-      lila.puzzle.Env.current.cli.process orElse
-      lila.tournament.Env.current.cli.process orElse
-      lila.explorer.Env.current.cli.process orElse
-      lila.fishnet.Env.current.cli.process orElse
-      lila.study.Env.current.cli.process orElse
-      lila.studySearch.Env.current.cli.process orElse
-      lila.coach.Env.current.cli.process orElse
-      lila.evalCache.Env.current.cli.process orElse
-      lila.plan.Env.current.cli.process orElse
+    security.cli.process orElse
+      teamSearch.cli.process orElse
+      forumSearch.cli.process orElse
+      team.cli.process orElse
+      puzzle.cli.process orElse
+      tournament.cli.process orElse
+      explorer.cli.process orElse
+      fishnet.cli.process orElse
+      study.cli.process orElse
+      studySearch.cli.process orElse
+      coach.cli.process orElse
+      evalCache.cli.process orElse
+      plan.cli.process orElse
+      msg.cli.process orElse
       process
 }

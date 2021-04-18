@@ -1,12 +1,12 @@
-import { game } from 'game';
-import { throttle } from 'common';
+import * as game from 'game';
+import throttle from 'common/throttle';
+import modal from 'common/modal';
+import notify from 'common/notification';
 import * as xhr from './xhr';
 import * as sound from './sound';
 import RoundController from './ctrl';
-import { Untyped, ApiEnd } from './interfaces';
-import { Simul } from 'game';
-
-const li = window.lichess;
+import { Untyped } from './interfaces';
+import { defined } from 'common';
 
 export interface RoundSocket extends Untyped {
   send: SocketSend;
@@ -14,7 +14,7 @@ export interface RoundSocket extends Untyped {
   moreTime(): void;
   outoftime(): void;
   berserk(): void;
-  sendLoading(typ: string, data?: any): void
+  sendLoading(typ: string, data?: any): void;
   receive(typ: string, data: any): boolean;
 }
 
@@ -27,30 +27,55 @@ interface Handlers {
   [key: string]: (data: any) => void;
 }
 
+type Callback = (...args: any[]) => void;
+
+function backoff(delay: number, factor: number, callback: Callback): Callback {
+  let timer: number | undefined;
+  let lastExec = 0;
+
+  return function (this: any, ...args: any[]): void {
+    const self: any = this;
+    const elapsed = performance.now() - lastExec;
+
+    function exec() {
+      timer = undefined;
+      lastExec = performance.now();
+      delay *= factor;
+      callback.apply(self, args);
+    }
+
+    if (timer) clearTimeout(timer);
+
+    if (elapsed > delay) exec();
+    else timer = setTimeout(exec, delay - elapsed);
+  };
+}
+
 export function make(send: SocketSend, ctrl: RoundController): RoundSocket {
+  lichess.socket.sign(ctrl.sign);
 
   function reload(o: Incoming, isRetry?: boolean) {
     // avoid reload if possible!
     if (o && o.t) {
       ctrl.setLoading(false);
       handlers[o.t](o.d);
-    }
-    else xhr.reload(ctrl).then(data => {
-      if (li.socket.getVersion() > data.player.version) {
-        // race condition! try to reload again
-        if (isRetry) li.reload(); // give up and reload the page
-        else reload(o, true);
-      }
-      else ctrl.reload(data);
-    });
-  };
+    } else
+      xhr.reload(ctrl).then(data => {
+        if (lichess.socket.getVersion() > data.player.version) {
+          // race condition! try to reload again
+          if (isRetry) lichess.reload();
+          // give up and reload the page
+          else reload(o, true);
+        } else ctrl.reload(data);
+      }, lichess.reload);
+  }
 
   const handlers: Handlers = {
     takebackOffers(o) {
       ctrl.setLoading(false);
       ctrl.data.player.proposingTakeback = o[ctrl.data.player.color];
-      const fromOp = ctrl.data.opponent.proposingTakeback = o[ctrl.data.opponent.color];
-      if (fromOp) li.desktopNotification(ctrl.trans.noarg('yourOpponentProposesATakeback'));
+      const fromOp = (ctrl.data.opponent.proposingTakeback = o[ctrl.data.opponent.color]);
+      if (fromOp) notify(ctrl.noarg('yourOpponentProposesATakeback'));
       ctrl.redraw();
     },
     move: ctrl.apiMove,
@@ -72,18 +97,16 @@ export function make(send: SocketSend, ctrl: RoundController): RoundSocket {
       }
     },
     crowd(o) {
-      game.setOnGame(ctrl.data, 'white', o['white']);
-      game.setOnGame(ctrl.data, 'black', o['black']);
+      ['white', 'black'].forEach(c => {
+        if (defined(o[c])) game.setOnGame(ctrl.data, c as Color, o[c]);
+      });
       ctrl.redraw();
     },
-    // end: function(winner) { } // use endData instead
-    endData(o: ApiEnd) {
-      ctrl.endWithData(o);
-    },
+    endData: ctrl.endWithData,
     rematchOffer(by: Color) {
       ctrl.data.player.offeringRematch = by === ctrl.data.player.color;
-      const fromOp = ctrl.data.opponent.offeringRematch = by === ctrl.data.opponent.color;
-      if (fromOp) li.desktopNotification(ctrl.trans.noarg('yourOpponentWantsToPlayANewGameWithYou'));
+      if ((ctrl.data.opponent.offeringRematch = by === ctrl.data.opponent.color))
+        notify(ctrl.noarg('yourOpponentWantsToPlayANewGameWithYou'));
       ctrl.redraw();
     },
     rematchTaken(nextId: string) {
@@ -92,20 +115,23 @@ export function make(send: SocketSend, ctrl: RoundController): RoundSocket {
       else ctrl.redraw();
     },
     drawOffer(by) {
-      ctrl.data.player.offeringDraw = by === ctrl.data.player.color;
-      const fromOp = ctrl.data.opponent.offeringDraw = by === ctrl.data.opponent.color;
-      if (fromOp) li.desktopNotification(ctrl.trans.noarg('yourOpponentOffersADraw'));
+      if (ctrl.isPlaying()) {
+        ctrl.data.player.offeringDraw = by === ctrl.data.player.color;
+        const fromOp = (ctrl.data.opponent.offeringDraw = by === ctrl.data.opponent.color);
+        if (fromOp) notify(ctrl.noarg('yourOpponentOffersADraw'));
+      }
+      if (by) {
+        let ply = ctrl.lastPly();
+        if ((by == 'white') == (ply % 2 == 0)) ply++;
+        ctrl.data.game.drawOffers = (ctrl.data.game.drawOffers || []).concat([ply]);
+      }
       ctrl.redraw();
     },
     berserk(color: Color) {
       ctrl.setBerserk(color);
     },
-    gone(isGone) {
-      if (!ctrl.data.opponent.ai) {
-        game.setIsGone(ctrl.data, ctrl.data.opponent.color, isGone);
-        ctrl.redraw();
-      }
-    },
+    gone: ctrl.setGone,
+    goneIn: ctrl.setGone,
     checkCount(e) {
       ctrl.data.player.checks = ctrl.data.player.color == 'white' ? e.white : e.black;
       ctrl.data.opponent.checks = ctrl.data.opponent.color == 'white' ? e.white : e.black;
@@ -116,30 +142,33 @@ export function make(send: SocketSend, ctrl: RoundController): RoundSocket {
         ctrl.opts.userId &&
         ctrl.data.simul &&
         ctrl.opts.userId == ctrl.data.simul.hostId &&
-          gameId !== ctrl.data.game.id &&
-          ctrl.moveOn.get() &&
-          ctrl.chessground.state.turnColor !== ctrl.chessground.state.movable.color) {
+        gameId !== ctrl.data.game.id &&
+        ctrl.moveOn.get() &&
+        !game.isPlayerTurn(ctrl.data)
+      ) {
         ctrl.setRedirecting();
         sound.move();
-        li.hasToReload = true;
         location.href = '/' + gameId;
       }
     },
-    simulEnd(simul: Simul) {
-      $.modal($(
-        '<p>Simul complete!</p><br /><br />' +
-        '<a class="button" href="/simul/' + simul.id + '">Back to ' + simul.name + ' simul</a>'
-      ));
-    }
+    simulEnd(simul: game.Simul) {
+      lichess.loadCssPath('modal');
+      modal(
+        $(
+          '<p>Simul complete!</p><br /><br />' +
+            `<a class="button" href="/simul/${simul.id}">Back to ${simul.name} simul</a>`
+        )
+      );
+    },
   };
 
-  li.pubsub.on('ab.rep', n => send('rep', { n: n }));
+  lichess.pubsub.on('ab.rep', n => send('rep', { n }));
 
   return {
     send,
     handlers,
     moreTime: throttle(300, () => send('moretime')),
-    outoftime: throttle(500, () => send('flag', ctrl.data.game.player)),
+    outoftime: backoff(500, 1.1, () => send('flag', ctrl.data.game.player)),
     berserk: throttle(200, () => send('berserk', null, { ackable: true })),
     sendLoading(typ: string, data?: any) {
       ctrl.setLoading(true);
@@ -151,6 +180,7 @@ export function make(send: SocketSend, ctrl: RoundController): RoundSocket {
         return true;
       }
       return false;
-    }
+    },
+    reload,
   };
 }

@@ -1,53 +1,25 @@
 package lila.tv
 
-import akka.actor._
-import com.typesafe.config.Config
+import akka.actor.ActorSystem
+import com.softwaremill.macwire._
 import scala.concurrent.duration._
 
-import lila.db.dsl._
-import lila.game.Game
-
-import scala.concurrent.duration._
-
+@Module
 final class Env(
-    config: Config,
-    db: lila.db.Env,
-    hub: lila.hub.Env,
+    gameRepo: lila.game.GameRepo,
+    renderer: lila.hub.actors.Renderer,
     lightUser: lila.common.LightUser.GetterSync,
-    roundProxyGame: Game.ID => Fu[Option[Game]],
+    gameProxyRepo: lila.round.GameProxyRepo,
     system: ActorSystem,
-    onSelect: Game => Unit
-) {
+    recentTvGames: lila.round.RecentTvGames,
+    rematches: lila.game.Rematches
+)(implicit ec: scala.concurrent.ExecutionContext) {
 
-  private val FeaturedSelect = config duration "featured.select"
+  private val tvTrouper = wire[TvTrouper]
 
-  private val selectChannel = new lila.socket.Channel(system)
-  system.lilaBus.subscribe(selectChannel, 'tvSelectChannel)
+  lazy val tv = wire[Tv]
 
-  private val tvTrouper = new TvTrouper(
-    system,
-    hub.renderer,
-    selectChannel,
-    lightUser,
-    onSelect
-  )
-
-  lazy val tv = new Tv(tvTrouper, roundProxyGame)
-
-  system.scheduler.schedule(10 seconds, FeaturedSelect) {
+  system.scheduler.scheduleWithFixedDelay(12 seconds, 3 seconds) { () =>
     tvTrouper ! TvTrouper.Select
   }
-}
-
-object Env {
-
-  lazy val current = "tv" boot new Env(
-    config = lila.common.PlayApp loadConfig "tv",
-    db = lila.db.Env.current,
-    hub = lila.hub.Env.current,
-    lightUser = lila.user.Env.current.lightUserSync,
-    roundProxyGame = lila.round.Env.current.roundProxyGame _,
-    system = lila.common.PlayApp.system,
-    onSelect = lila.round.Env.current.recentTvGames.put _
-  )
 }

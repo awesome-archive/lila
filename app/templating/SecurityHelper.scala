@@ -1,9 +1,8 @@
 package lila.app
 package templating
 
-import play.twirl.api.Html
-
-import lila.security.{ Permission, Granter }
+import lila.app.ui.ScalatagsTemplate._
+import lila.security.{ Granter, Permission }
 import lila.user.{ User, UserContext }
 
 trait SecurityHelper {
@@ -20,13 +19,11 @@ trait SecurityHelper {
   def isGranted(permission: Permission, user: User): Boolean =
     Granter(permission)(user)
 
+  def canGrant = Granter.canGrant _
+
   def canViewRoles(user: User)(implicit ctx: UserContext): Boolean =
     isGranted(_.ChangePermission) || (isGranted(_.Admin) && user.roles.nonEmpty)
 
-  def reportScore(score: lila.report.Report.Score) = Html {
-    s"""<div class="score ${score.color}" title="Report score">${score.value.toInt}</div>"""
-  }
-  // def reportScore(score: lila.report.Report.Score) = Html {
-  //   s"""<div class="score"><i>Score</i><strong>${score.value.toInt}</strong></div>"""
-  // }
+  def reportScore(score: lila.report.Report.Score): Frag =
+    span(cls := s"score ${score.color}")(score.value.toInt)
 }

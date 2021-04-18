@@ -4,8 +4,7 @@ var mapSide = require('./map/mapSide');
 var run = require('./run/runMain');
 var storage = require('./storage');
 
-module.exports = function(element, opts) {
-
+module.exports = function (element, opts) {
   opts.storage = storage(opts.data);
   delete opts.data;
 
@@ -15,19 +14,17 @@ module.exports = function(element, opts) {
   var side = mapSide(opts, trans);
   var sideCtrl = side.controller();
 
-  opts.setStage = sideCtrl.setStage;
-
-  m.module(opts.sideElement, {
-    controller: function() {
-      return sideCtrl;
+  opts.side = {
+    ctrl: sideCtrl,
+    view: function () {
+      return side.view(sideCtrl);
     },
-    view: side.view
-  });
+  };
 
   m.route(element, '/', {
     '/': map(opts, trans),
     '/:stage/:level': run(opts, trans),
-    '/:stage': run(opts, trans)
+    '/:stage': run(opts, trans),
   });
 
   return {};

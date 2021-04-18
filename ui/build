@@ -1,16 +1,25 @@
 #!/bin/bash -ea
-target=${1-dev}
-mode=${2-build} # use "upgrade" to upgrade all deps
 
+target=${1-dev}
+mode=${2-build} # build | upgrade | css | js
 echo "building ui modules with target=$target and mode=$mode"
+
+echo "node: $(node --version)"
+echo "yarn: $(yarn --version)"
 
 cd "$(git rev-parse --show-toplevel)"
 
+ls -l node_modules node_modules/@* ui/node_modules ui/*/node_modules | grep /yarn/link/ || true
+
 mkdir -p public/compiled
 
-ts_apps1="common chess"
-ts_apps2="ceval game tree chat"
-apps="site chat cli challenge notify learn insight editor puzzle round analyse lobby tournament tournamentSchedule tournamentCalendar simul perfStat dasher"
+apps1="common"
+apps2="chess ceval game tree chat nvui puz"
+apps3="site swiss msg chat cli challenge notify learn insight editor puzzle round analyse lobby tournament tournamentSchedule tournamentCalendar simul dasher speech palantir serviceWorker dgt storm racer"
+site_plugins="tvEmbed puzzleEmbed analyseEmbed user modUser clas coordinate captcha expandText team forum account coachShow coachForm challengePage checkout login passwordComplexity tourForm teamBattleForm gameSearch userComplete infiniteScroll flatpickr teamAdmin appeal modGames publicChats"
+round_plugins="nvui keyboardMove"
+analyse_plugins="nvui studyTopicForm"
+puzzle_plugins="dashboard"
 
 if [ $mode == "upgrade" ]; then
   yarn upgrade --non-interactive
@@ -18,31 +27,53 @@ else
   yarn install --non-interactive
 fi
 
-build_ts() {
-  echo "build_ts" "$@"
-  set -ev
-  cd ui/$1
-  yarn run compile
-}
-
 build() {
-  echo "build" "$@"
+  echo
+  echo "### ui/$@ ###"
   set -ev
-  cd ui/$1
-  gulp $target
+  if [[ $1 == "css" ]]; then
+    cd ui
+    yarn run gulp "css-$target"
+  else
+    cd ui/$1
+    yarn run $target
+  fi
 }
 
-if type -p parallel; then # parallel execution!
-  if [ -z "$P_OPTS" -a ! -e ~/.parallel/config ]; then
-    P_OPTS="-j+4 --halt 2"
-    [ "$TRAVIS" = "true" ] || P_OPTS+=" --bar"
+build_plugin() {
+  echo
+  echo "### ui/$1 plugin $2 ###"
+  set -ev
+  cd ui/$1
+  yarn run plugin-$target $2
+}
+
+if [ $mode != "upgrade" ] && [ $mode != "js" ]; then
+  apps3="css $apps3"
+fi
+
+if [ $mode == "css" ]; then
+  (build css)
+else
+  if type -p parallel; then # parallel execution!
+    if [ -z "$P_OPTS" -a ! -e ~/.parallel/config ]; then
+      P_OPTS="-j+4 --halt 2"
+      [ -n "$GITHUB_WORKFLOW" ] || P_OPTS+=" --bar"
+    fi
+    set -x
+    parallel --gnu $P_OPTS build ::: $apps1
+    parallel --gnu $P_OPTS build ::: $apps2
+    parallel --gnu $P_OPTS build ::: $apps3
+    parallel --gnu $P_OPTS build_plugin site ::: $site_plugins
+    parallel --gnu $P_OPTS build_plugin round ::: $round_plugins
+    parallel --gnu $P_OPTS build_plugin analyse ::: $analyse_plugins
+    parallel --gnu $P_OPTS build_plugin puzzle ::: $puzzle_plugins
+  else # sequential execution
+    echo "For faster builds, install GNU parallel."
+    for app in $apps1 $apps2 $apps3; do (build $app); done
+    for plugin in $site_plugins; do (build_plugin site $plugin); done
+    for plugin in $round_plugins; do (build_plugin round $plugin); done
+    for plugin in $analyse_plugins; do (build_plugin analyse $plugin); done
+    for plugin in $puzzle_plugins; do (build_plugin puzzle $plugin); done
   fi
-  set -x
-  parallel --gnu $P_OPTS build_ts ::: $ts_apps1
-  parallel --gnu $P_OPTS build_ts ::: $ts_apps2
-  parallel --gnu $P_OPTS build ::: $apps
-else # sequential execution
-  echo "For faster builds, install GNU parallel."
-  for app in $ts_apps1 $ts_apps2; do (build_ts $app); done
-  for app in $apps; do (build $app); done
 fi

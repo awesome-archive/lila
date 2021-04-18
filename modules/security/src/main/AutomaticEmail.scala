@@ -1,117 +1,155 @@
 package lila.security
 
-import play.twirl.api.Html
+import play.api.i18n.Lang
+import scala.util.chaining._
 
-import lila.common.{ Lang, EmailAddress }
-import lila.common.String.html.nl2brUnsafe
+import lila.common.config.BaseUrl
+import lila.common.EmailAddress
+import lila.hub.actorApi.msg.SystemMsg
+import lila.i18n.I18nKeys.{ emails => trans }
 import lila.user.{ User, UserRepo }
+import lila.base.LilaException
 
 final class AutomaticEmail(
-    mailgun: Mailgun,
-    baseUrl: String
-) {
+    userRepo: UserRepo,
+    mailer: Mailer,
+    baseUrl: BaseUrl
+)(implicit ec: scala.concurrent.ExecutionContext) {
 
-  def onTitleSet(username: String)(implicit lang: Lang): Funit = for {
-    user <- UserRepo named username flatten s"No such user $username"
-    emailOption <- UserRepo email user.id
-  } yield for {
-    title <- user.title
-    email <- emailOption
-  } yield {
+  import Mailer.html._
 
+  val regards = """Regards,
+
+The Lichess team"""
+
+  def welcome(user: User, email: EmailAddress)(implicit lang: Lang): Funit = {
+    lila.mon.email.send.welcome.increment()
     val profileUrl = s"$baseUrl/@/${user.username}"
-    val body = s"""Hello,
-
-Thank you for confirming your $title title on lichess.org.
-It is now visible on your profile page: ${baseUrl}/@/${user.username}.
-
-Regards,
-
-The lichess team
-"""
-
-    mailgun send Mailgun.Message(
+    val editUrl    = s"$baseUrl/account/profile"
+    mailer send Mailer.Message(
       to = email,
-      subject = s"$title title confirmed on lichess.org",
+      subject = trans.welcome_subject.txt(user.username),
       text = s"""
-$body
+${trans.welcome_text.txt(profileUrl, editUrl)}
 
-${Mailgun.txt.serviceNote}
+${Mailer.txt.serviceNote}
 """,
-      htmlBody = Html(s"""
-<div itemscope itemtype="http://schema.org/EmailMessage">
-  <p itemprop="description">${nl2brUnsafe(body)}</p>
-  ${Mailgun.html.serviceNote}
-</div>""").some
+      htmlBody = standardEmail(
+        trans.welcome_text.txt(profileUrl, editUrl)
+      ).some
     )
   }
 
-  def onBecomeCoach(user: User)(implicit lang: Lang): Funit =
-    UserRepo email user.id flatMap {
-      _ ?? { email =>
-        val body = s"""Hello,
+  def onTitleSet(username: String): Funit = {
+    for {
+      user        <- userRepo named username orFail s"No such user $username"
+      emailOption <- userRepo email user.id
+      title       <- fuccess(user.title) orFail "User doesn't have a title!"
+      body = alsoSendAsPrivateMessage(user) { implicit lang =>
+        s"""Hello,
 
-It is our pleasure to welcome you as a certified lichess coach.
-Your coach profile awaits you on ${baseUrl}/coach/edit.
+Thank you for confirming your $title title on Lichess.
+It is now visible on your profile page: $baseUrl/@/${user.username}.
 
-Regards,
-
-The lichess team
+$regards
 """
+      }
+      _ <- emailOption ?? { email =>
+        implicit val lang = userLang(user)
+        mailer send Mailer.Message(
+          to = email,
+          subject = s"$title title confirmed on lichess.org",
+          text = s"""
+$body
 
-        mailgun send Mailgun.Message(
+${Mailer.txt.serviceNote}
+""",
+          htmlBody = standardEmail(body).some
+        )
+      }
+    } yield ()
+  } recover { case e: LilaException =>
+    logger.info(e.message)
+  }
+
+  def onBecomeCoach(user: User): Funit = {
+    val body = alsoSendAsPrivateMessage(user) { implicit lang =>
+      s"""Hello,
+
+It is our pleasure to welcome you as a Lichess coach.
+Your coach profile awaits you on $baseUrl/coach/edit.
+
+$regards
+"""
+    }
+    userRepo email user.id flatMap {
+      _ ?? { email =>
+        implicit val lang = userLang(user)
+        mailer send Mailer.Message(
           to = email,
           subject = "Coach profile unlocked on lichess.org",
           text = s"""
 $body
 
-${Mailgun.txt.serviceNote}
+${Mailer.txt.serviceNote}
 """,
-          htmlBody = Html(s"""
-<div itemscope itemtype="http://schema.org/EmailMessage">
-  <p itemprop="description">${nl2brUnsafe(body)}</p>
-  ${Mailgun.html.serviceNote}
-</div>""").some
+          htmlBody = standardEmail(body).some
         )
       }
     }
+  }
 
-  def onFishnetKey(userId: User.ID, key: String)(implicit lang: Lang): Funit = for {
-    user <- UserRepo named userId flatten s"No such user $userId"
-    emailOption <- UserRepo email user.id
-  } yield emailOption ?? { email =>
+  def onFishnetKey(userId: User.ID, key: String): Funit =
+    for {
+      user        <- userRepo named userId orFail s"No such user $userId"
+      emailOption <- userRepo email user.id
+      body = alsoSendAsPrivateMessage(user) { implicit lang =>
+        s"""Hello,
 
-    val body = s"""Hello,
+This message contains your private fishnet key. Please treat it like a password. You can use the same key on multiple machines (even at the same time), but you should not share it with anyone.
 
-Here is your private fishnet key:
+Thank you very much for your help! Thanks to you, chess lovers all around the world will enjoy swift and powerful analysis for their games.
+
+Your key is:
 
 $key
 
-
-Please treat it like a password. You can use the same key on multiple machine,
-but you should not share it with anyone.
-
-Thank you very much for your help! Thanks to you, chess lovers all around the world
-will enjoy swift and powerful analysis for their games.
-
-Regards,
-
-The lichess team
+$regards
 """
-
-    mailgun send Mailgun.Message(
-      to = email,
-      subject = "Your private fishnet key",
-      text = s"""
+      }
+      _ <- emailOption.?? { email =>
+        implicit val lang = userLang(user)
+        mailer send Mailer.Message(
+          to = email,
+          subject = "Your private fishnet key",
+          text = s"""
 $body
 
-${Mailgun.txt.serviceNote}
+${Mailer.txt.serviceNote}
 """,
-      htmlBody = Html(s"""
-<div itemscope itemtype="http://schema.org/EmailMessage">
-  <p itemprop="description">${nl2brUnsafe(body)}</p>
-  ${Mailgun.html.serviceNote}
-</div>""").some
-    )
+          htmlBody = standardEmail(body).some
+        )
+      }
+    } yield ()
+
+  def onAppealReply(user: User): Funit = {
+    alsoSendAsPrivateMessage(user) { implicit lang =>
+      s"""Hello,
+
+      Your appeal has received a response from the moderation team: ${baseUrl}/appeal
+
+$regards
+"""
+    }
+    funit
   }
+
+  private def alsoSendAsPrivateMessage(user: User)(body: Lang => String): String = {
+    implicit val lang = userLang(user)
+    body(userLang(user)) tap { txt =>
+      lila.common.Bus.publish(SystemMsg(user.id, txt), "msgSystemSend")
+    }
+  }
+
+  private def userLang(user: User): Lang = user.realLang | lila.i18n.defaultLang
 }

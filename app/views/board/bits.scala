@@ -1,52 +1,57 @@
 package views.html.board
 
+import chess.format.{ FEN, Forsyth }
+import controllers.routes
 import play.api.libs.json.Json
-import scala.concurrent.duration.Duration
 
 import lila.api.Context
 import lila.app.templating.Environment._
 import lila.app.ui.ScalatagsTemplate._
-
-import controllers.routes
+import lila.game.Pov
 
 object bits {
 
+  private val dataState = attr("data-state")
+
+  private def miniOrientation(pov: Pov): chess.Color =
+    if (pov.game.variant == chess.variant.RacingKings) chess.White else pov.player.color
+
+  def mini(pov: Pov): Tag => Tag =
+    mini(
+      FEN(Forsyth.boardAndColor(pov.game.situation)),
+      miniOrientation(pov),
+      ~pov.game.lastMoveKeys
+    ) _
+
+  def mini(fen: chess.format.FEN, color: chess.Color = chess.White, lastMove: String = "")(tag: Tag): Tag =
+    tag(
+      cls := "mini-board mini-board--init cg-wrap is2d",
+      dataState := s"${fen.value},${color.name},$lastMove"
+    )(cgWrapContent)
+
+  def miniSpan(fen: chess.format.FEN, color: chess.Color = chess.White, lastMove: String = "") =
+    mini(fen, color, lastMove)(span)
+
   def jsData(
-    sit: chess.Situation,
-    fen: String,
-    animationDuration: Duration
-  )(implicit ctx: Context) = Json.obj(
-    "fen" -> fen.split(" ").take(4).mkString(" "),
-    "baseUrl" -> s"$netBaseUrl${routes.Editor.load("")}",
-    "color" -> sit.color.letter.toString,
-    "castles" -> Json.obj(
-      "K" -> (sit canCastle chess.White on chess.KingSide),
-      "Q" -> (sit canCastle chess.White on chess.QueenSide),
-      "k" -> (sit canCastle chess.Black on chess.KingSide),
-      "q" -> (sit canCastle chess.Black on chess.QueenSide)
-    ),
-    "animation" -> Json.obj(
-      "duration" -> ctx.pref.animationFactor * animationDuration.toMillis
-    ),
-    "is3d" -> ctx.pref.is3d,
-    "i18n" -> i18nJsObject(translations)(ctxLang(ctx))
-  )
-
-  def domPreload(pov: Option[lila.game.Pov])(implicit ctx: Context) = {
-    val theme = ctx.currentTheme
-    div(cls := "lichess_game")(
-      div(cls := "lichess_board_wrap")(
-        div(cls := "lichess_board")(
-          (!ctx.pref.is3d) option raw(s"""<svg version="1.1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 800 800">
-<rect width="800" height="800" fill="#${theme.dark}"/><g fill="#${theme.light}" id="a"><g id="b"><g id="c"><g id="d">
-<rect width="100" height="100" id="e"/><use x="200" xlink:href="#e"/></g><use x="400" xlink:href="#d"/></g><use x="100" y="100" xlink:href="#c"/></g><use y="200" xlink:href="#b"/></g><use y="400" xlink:href="#a"/></svg>"""),
-          pov.fold(miniBoardContent)(chessground)
-        )
-      )
+      sit: chess.Situation,
+      fen: FEN
+  )(implicit ctx: Context) =
+    Json.obj(
+      "fen"     -> fen.value.split(" ").take(4).mkString(" "),
+      "baseUrl" -> s"$netBaseUrl${routes.Editor.load("")}",
+      "color"   -> sit.color.letter.toString,
+      "castles" -> Json.obj(
+        "K" -> (sit canCastle chess.White on chess.KingSide),
+        "Q" -> (sit canCastle chess.White on chess.QueenSide),
+        "k" -> (sit canCastle chess.Black on chess.KingSide),
+        "q" -> (sit canCastle chess.Black on chess.QueenSide)
+      ),
+      "animation" -> Json.obj("duration" -> ctx.pref.animationMillis),
+      "is3d"      -> ctx.pref.is3d,
+      "i18n"      -> i18nJsObject(i18nKeyes)
     )
-  }
 
-  private val translations = List(
+  private val i18nKeyes = List(
     trans.setTheBoard,
     trans.boardEditor,
     trans.startPosition,
@@ -63,6 +68,7 @@ object bits {
     trans.continueFromHere,
     trans.playWithTheMachine,
     trans.playWithAFriend,
-    trans.analysis
-  )
+    trans.analysis,
+    trans.toStudy
+  ).map(_.key)
 }

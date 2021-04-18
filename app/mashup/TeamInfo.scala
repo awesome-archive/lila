@@ -1,64 +1,85 @@
 package lila.app
 package mashup
 
-import scala.concurrent.duration._
-
 import lila.forum.MiniForumPost
-import lila.team.{ Team, RequestRepo, MemberRepo, RequestWithUser, TeamApi }
-import lila.user.{ User, UserRepo }
+import lila.team.{ RequestRepo, RequestWithUser, Team, TeamApi }
+import lila.tournament.{ Tournament, TournamentApi }
+import lila.user.User
+import lila.swiss.{ Swiss, SwissApi }
+import lila.simul.{ Simul, SimulApi }
 
 case class TeamInfo(
     mine: Boolean,
-    createdByMe: Boolean,
+    ledByMe: Boolean,
     requestedByMe: Boolean,
+    subscribed: Boolean,
     requests: List[RequestWithUser],
-    bestUserIds: List[User.ID],
-    toints: Int,
-    forumNbPosts: Int,
-    forumPosts: List[MiniForumPost]
+    forumPosts: List[MiniForumPost],
+    tours: TeamInfo.PastAndNext,
+    simuls: Seq[Simul]
 ) {
 
   def hasRequests = requests.nonEmpty
 
-  def userIds = bestUserIds ::: forumPosts.flatMap(_.userId)
+  def userIds = forumPosts.flatMap(_.userId)
+}
+
+object TeamInfo {
+  case class AnyTour(any: Either[Tournament, Swiss]) extends AnyVal {
+    def isEnterable = any.fold(_.isEnterable, _.isEnterable)
+    def startsAt    = any.fold(_.startsAt, _.startsAt)
+    def isNowOrSoon = any.fold(_.isNowOrSoon, _.isNowOrSoon)
+    def nbPlayers   = any.fold(_.nbPlayers, _.nbPlayers)
+  }
+  def anyTour(tour: Tournament) = AnyTour(Left(tour))
+  def anyTour(swiss: Swiss)     = AnyTour(Right(swiss))
+
+  case class PastAndNext(past: List[AnyTour], next: List[AnyTour]) {
+    def nonEmpty = past.nonEmpty || next.nonEmpty
+  }
 }
 
 final class TeamInfoApi(
     api: TeamApi,
-    getForumNbPosts: String => Fu[Int],
-    getForumPosts: String => Fu[List[MiniForumPost]],
-    asyncCache: lila.memo.AsyncCache.Builder
-) {
+    forumRecent: lila.forum.ForumRecent,
+    tourApi: TournamentApi,
+    swissApi: SwissApi,
+    simulApi: SimulApi,
+    requestRepo: RequestRepo
+)(implicit ec: scala.concurrent.ExecutionContext) {
 
-  private case class Cachable(bestUserIds: List[User.ID], toints: Int)
+  import TeamInfo._
 
-  private def fetchCachable(id: String): Fu[Cachable] = for {
-    userIds ← (MemberRepo userIdsByTeam id)
-    bestUserIds ← UserRepo.idsByIdsSortRating(userIds, 10)
-    toints ← UserRepo.idsSumToints(userIds)
-  } yield Cachable(bestUserIds, toints)
+  def apply(team: Team, me: Option[User]): Fu[TeamInfo] =
+    for {
+      requests      <- (team.enabled && me.exists(m => team.leaders(m.id))) ?? api.requestsWithUsers(team)
+      mine          <- me.??(m => api.belongsTo(team.id, m.id))
+      requestedByMe <- !mine ?? me.??(m => requestRepo.exists(team.id, m.id))
+      subscribed    <- me.ifTrue(mine) ?? { api.isSubscribed(team, _) }
+      forumPosts    <- forumRecent.team(team.id)
+      tours         <- tournaments(team, 5, 5)
+      simuls        <- simulApi.byTeamLeaders(team.id, team.leaders.toSeq)
+    } yield TeamInfo(
+      mine = mine,
+      ledByMe = me.exists(m => team.leaders(m.id)),
+      requestedByMe = requestedByMe,
+      subscribed = subscribed,
+      requests = requests,
+      forumPosts = forumPosts,
+      tours = tours,
+      simuls = simuls
+    )
 
-  private val cache = asyncCache.multi[String, Cachable](
-    name = "teamInfo",
-    f = fetchCachable,
-    expireAfter = _.ExpireAfterWrite(10 minutes)
-  )
-
-  def apply(team: Team, me: Option[User]): Fu[TeamInfo] = for {
-    requests ← (team.enabled && me.??(m => team.isCreator(m.id))) ?? api.requestsWithUsers(team)
-    mine <- me.??(m => api.belongsTo(team.id, m.id))
-    requestedByMe ← !mine ?? me.??(m => RequestRepo.exists(team.id, m.id))
-    cachable <- cache get team.id
-    forumNbPosts ← getForumNbPosts(team.id)
-    forumPosts ← getForumPosts(team.id)
-  } yield TeamInfo(
-    mine = mine,
-    createdByMe = ~me.map(m => team.isCreator(m.id)),
-    requestedByMe = requestedByMe,
-    requests = requests,
-    bestUserIds = cachable.bestUserIds,
-    toints = cachable.toints,
-    forumNbPosts = forumNbPosts,
-    forumPosts = forumPosts
-  )
+  def tournaments(team: Team, nbPast: Int, nbSoon: Int): Fu[PastAndNext] =
+    tourApi.visibleByTeam(team.id, nbPast, nbSoon) zip swissApi.visibleByTeam(team.id, nbPast, nbSoon) map {
+      case (tours, swisses) =>
+        PastAndNext(
+          past = {
+            tours.past.map(anyTour) ::: swisses.past.map(anyTour)
+          }.sortBy(-_.startsAt.getSeconds),
+          next = {
+            tours.next.map(anyTour) ::: swisses.next.map(anyTour)
+          }.sortBy(_.startsAt.getSeconds)
+        )
+    }
 }

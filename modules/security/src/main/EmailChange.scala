@@ -1,73 +1,79 @@
 package lila.security
 
-import play.twirl.api.Html
-
-import lila.common.{ Lang, EmailAddress }
-import lila.user.{ User, UserRepo }
+import scalatags.Text.all._
+import lila.common.config._
+import lila.common.EmailAddress
 import lila.i18n.I18nKeys.{ emails => trans }
+import lila.user.{ User, UserRepo }
 
 final class EmailChange(
-    mailgun: Mailgun,
-    baseUrl: String,
-    tokenerSecret: String
-) {
+    userRepo: UserRepo,
+    mailer: Mailer,
+    baseUrl: BaseUrl,
+    tokenerSecret: Secret
+)(implicit ec: scala.concurrent.ExecutionContext) {
 
-  def send(user: User, email: EmailAddress)(implicit lang: Lang): Funit =
+  import Mailer.html._
+
+  def send(user: User, email: EmailAddress): Funit =
     tokener make TokenPayload(user.id, email).some flatMap { token =>
-      lila.mon.email.change()
-      val url = s"$baseUrl/account/email/confirm/$token"
+      lila.mon.email.send.change.increment()
+      implicit val lang = user.realLang | lila.i18n.defaultLang
+      val url           = s"$baseUrl/account/email/confirm/$token"
       lila.log("auth").info(s"Change email URL ${user.username} $email $url")
-      mailgun send Mailgun.Message(
+      mailer send Mailer.Message(
         to = email,
-        subject = trans.emailChange_subject.literalTxtTo(lang, List(user.username)),
+        subject = trans.emailChange_subject.txt(user.username),
         text = s"""
-${trans.emailChange_intro.literalTxtTo(lang)}
-${trans.emailChange_click.literalTxtTo(lang)}
+${trans.emailChange_intro.txt()}
+${trans.emailChange_click.txt()}
 
 $url
 
-${trans.common_orPaste.literalTxtTo(lang)}
+${trans.common_orPaste.txt()}
 
-${Mailgun.txt.serviceNote}
+${Mailer.txt.serviceNote}
 """,
-        htmlBody = Html(s"""
-<div itemscope itemtype="http://schema.org/EmailMessage">
-  <p itemprop="description">${trans.emailChange_intro.literalHtmlTo(lang)}</p>
-  <p>${trans.emailChange_click.literalHtmlTo(lang)}</p>
-  <div itemprop="potentialAction" itemscope itemtype="http://schema.org/ViewAction">
-    <meta itemprop="name" content="Change email address">
-    ${Mailgun.html.url(url)}
-  </div>
-  ${Mailgun.html.serviceNote}
-</div>""").some
+        htmlBody = emailMessage(
+          pDesc(trans.emailChange_intro()),
+          p(trans.emailChange_click()),
+          potentialAction(metaName("Change email address"), Mailer.html.url(url)),
+          serviceNote
+        ).some
       )
     }
 
-  def confirm(token: String): Fu[Option[User]] =
-    tokener read token map (_.flatten) flatMap {
-      _ ?? {
-        case TokenPayload(userId, email) =>
-          UserRepo.email(userId, email).nevermind >> UserRepo.byId(userId)
+  // also returns the previous email address
+  def confirm(token: String): Fu[Option[(User, Option[EmailAddress])]] =
+    tokener read token dmap (_.flatten) flatMap {
+      _ ?? { case TokenPayload(userId, email) =>
+        userRepo.email(userId) flatMap { previous =>
+          (userRepo.setEmail(userId, email).nevermind >> userRepo.byId(userId))
+            .map2(_ -> previous)
+        }
       }
     }
 
   case class TokenPayload(userId: User.ID, email: EmailAddress)
 
-  private implicit final val payloadSerializable = new StringToken.Serializable[Option[TokenPayload]] {
+  implicit final private val payloadSerializable = new StringToken.Serializable[Option[TokenPayload]] {
     private val sep = ' '
-    def read(str: String) = str.split(sep) match {
-      case Array(id, email) => EmailAddress from email map { TokenPayload(id, _) }
-      case _ => none
-    }
-    def write(a: Option[TokenPayload]) = a ?? {
-      case TokenPayload(userId, email) => s"$userId$sep$email"
-    }
+    def read(str: String) =
+      str.split(sep) match {
+        case Array(id, email) => EmailAddress from email map { TokenPayload(id, _) }
+        case _                => none
+      }
+    def write(a: Option[TokenPayload]) =
+      a ?? { case TokenPayload(userId, EmailAddress(email)) =>
+        s"$userId$sep$email"
+      }
   }
 
   private val tokener = new StringToken[Option[TokenPayload]](
     secret = tokenerSecret,
-    getCurrentValue = p => p ?? {
-      case TokenPayload(userId, _) => UserRepo email userId map (_.??(_.value))
-    }
+    getCurrentValue = p =>
+      p ?? { case TokenPayload(userId, _) =>
+        userRepo email userId dmap (_.??(_.value))
+      }
   )
 }

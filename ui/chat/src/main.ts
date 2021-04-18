@@ -1,37 +1,29 @@
-import { init } from 'snabbdom';
-import { VNode } from 'snabbdom/vnode'
+import { init, attributesModule, classModule } from 'snabbdom';
 
 import makeCtrl from './ctrl';
 import view from './view';
-import { ChatOpts, Ctrl } from './interfaces'
-import { PresetCtrl } from './preset'
-
-import klass from 'snabbdom/modules/class';
-import attributes from 'snabbdom/modules/attributes';
+import { ChatOpts } from './interfaces';
+import { PresetCtrl } from './preset';
 
 export { Ctrl as ChatCtrl, ChatPlugin } from './interfaces';
 
-export default function LichessChat(element: Element, opts: ChatOpts): {
-  preset: PresetCtrl
+export default function LichessChat(
+  element: Element,
+  opts: ChatOpts
+): {
+  preset: PresetCtrl;
 } {
-  const patch = init([klass, attributes]);
+  const patch = init([classModule, attributesModule]);
 
-  const container = element.parentNode as HTMLElement;
+  const ctrl = makeCtrl(opts, redraw);
 
-  let vnode: VNode, ctrl: Ctrl
+  const blueprint = view(ctrl);
+  element.innerHTML = '';
+  let vnode = patch(element, blueprint);
 
   function redraw() {
     vnode = patch(vnode, view(ctrl));
   }
 
-  ctrl = makeCtrl(opts, redraw);
-
-  vnode = patch(element, view(ctrl));
-
-  window.Mousetrap.bind('/', () => {
-    (container.querySelector('input.lichess_say') as HTMLElement).focus();
-    return false;
-  });
-
   return ctrl;
-};
+}

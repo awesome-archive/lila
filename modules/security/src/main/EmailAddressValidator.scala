@@ -4,96 +4,97 @@ import play.api.data.validation._
 import scala.concurrent.duration._
 
 import lila.common.EmailAddress
-import lila.user.User
+import lila.user.{ User, UserRepo }
 
-/**
- * Validate and normalize emails
- */
+/** Validate and normalize emails
+  */
 final class EmailAddressValidator(
+    userRepo: UserRepo,
     disposable: DisposableEmailDomain,
-    dnsApi: DnsApi
+    dnsApi: DnsApi,
+    checkMail: CheckMail
 ) {
 
-  // email was already regex-validated at this stage
-  def validate(email: EmailAddress): Option[EmailAddress] =
+  private def isAcceptable(email: EmailAddress): Boolean =
+    email.domain exists disposable.isOk
 
-    // start by lower casing the entire address
-    email.value.toLowerCase
-      // separate name from domain
-      .split('@') match {
+  def validate(email: EmailAddress): Option[EmailAddressValidator.Acceptable] =
+    isAcceptable(email) option EmailAddressValidator.Acceptable(email)
 
-        // gmail addresses
-        case Array(name, domain) if gmailDomains(domain) => name
-        .replace(".", "") // remove all dots
-        .takeWhile('+'!=) // skip everything after the first +
-        .some.filter(_.nonEmpty) // make sure something remains
-        .map(radix => EmailAddress(s"$radix@$domain")) // okay
-
-        // disposable addresses
-        case Array(_, domain) if disposable fromDomain domain => none
-
-        // other valid addresses
-        case Array(name, domain) if domain contains "." => EmailAddress(s"$name@$domain").some
-
-        // invalid addresses
-        case _ => none
-      }
-
-  def isValid(email: EmailAddress) = validate(email).isDefined
-
-  /**
-   * Returns true if an E-mail address is taken by another user.
-   * @param email The E-mail address to be checked
-   * @param forUser Optionally, the user the E-mail address field is to be assigned to.
-   *                If they already have it assigned, returns false.
-   * @return
-   */
-  private def isTakenBySomeoneElse(email: EmailAddress, forUser: Option[User]): Boolean =
-    (lila.user.UserRepo.idByEmail(email) awaitSeconds 2, forUser) match {
-      case (None, _) => false
+  /** Returns true if an E-mail address is taken by another user.
+    * @param email The E-mail address to be checked
+    * @param forUser Optionally, the user the E-mail address field is to be assigned to.
+    *                If they already have it assigned, returns false.
+    * @return
+    */
+  private def isTakenBySomeoneElse(email: EmailAddress, forUser: Option[User]): Fu[Boolean] =
+    userRepo.idByEmail(email.normalize) dmap (_ -> forUser) dmap {
+      case (None, _)                  => false
       case (Some(userId), Some(user)) => userId != user.id
-      case (_, _) => true
+      case (_, _)                     => true
     }
 
+  private def wasUsedTwiceRecently(email: EmailAddress): Fu[Boolean] =
+    userRepo.countRecentByPrevEmail(email.normalize).dmap(1 <)
+
   val acceptableConstraint = Constraint[String]("constraint.email_acceptable") { e =>
-    if (isValid(EmailAddress(e))) Valid
+    if (EmailAddress.from(e).exists(isAcceptable)) Valid
     else Invalid(ValidationError("error.email_acceptable"))
   }
 
-  def uniqueConstraint(forUser: Option[User]) = Constraint[String]("constraint.email_unique") { e =>
-    if (isTakenBySomeoneElse(EmailAddress(e), forUser))
-      Invalid(ValidationError("error.email_unique"))
-    else Valid
+  val sendableConstraint = Constraint[String]("constraint.email_acceptable") { e =>
+    if (EmailAddress.from(e).exists(_.isSendable)) Valid
+    else Invalid(ValidationError("error.email_acceptable"))
   }
 
-  def differentConstraint(than: Option[EmailAddress]) = Constraint[String]("constraint.email_different") { e =>
-    if (than has EmailAddress(e))
-      Invalid(ValidationError("error.email_different"))
-    else Valid
-  }
+  def uniqueConstraint(forUser: Option[User]) =
+    Constraint[String]("constraint.email_unique") { e =>
+      val email = EmailAddress(e)
+      val (taken, reused) =
+        (isTakenBySomeoneElse(email, forUser) zip wasUsedTwiceRecently(email)).await(2 seconds, "emailUnique")
+      if (taken || reused) Invalid(ValidationError("error.email_unique"))
+      else Valid
+    }
+
+  def differentConstraint(than: Option[EmailAddress]) =
+    Constraint[String]("constraint.email_different") { e =>
+      if (than has EmailAddress(e))
+        Invalid(ValidationError("error.email_different"))
+      else Valid
+    }
 
   // make sure the cache is warmed up, so next call can be synchronous
   def preloadDns(e: EmailAddress): Funit = hasAcceptableDns(e).void
 
   // only compute valid and non-whitelisted email domains
-  private def hasAcceptableDns(e: EmailAddress): Fu[Boolean] = validate(e) ?? {
-    _.domain ?? { domain =>
+  private def hasAcceptableDns(e: EmailAddress): Fu[Boolean] =
+    isAcceptable(e) ?? e.domain.map(_.lower) ?? { domain =>
       if (DisposableEmailDomain whitelisted domain) fuccess(true)
-      else dnsApi.a(domain) >>& dnsApi.mx(domain).map { domains =>
-        domains.nonEmpty && domains.forall { !disposable(_) }
-      }
+      else
+        dnsApi.mx(domain).dmap { domains =>
+          domains.nonEmpty && !domains.exists { disposable(_) }
+        } >>& checkMail(domain)
     }
-  }
 
   // the DNS emails should have been preloaded
   private[security] val withAcceptableDns = Constraint[String]("constraint.email_acceptable") { e =>
-    val ok = hasAcceptableDns(EmailAddress(e)).awaitOrElse(100.millis, {
-      logger.warn(s"EmailAddressValidator.withAcceptableDns timeout! ${e} records should have been preloaded")
-      true
-    })
-    if (ok) Valid
+    if (
+      EmailAddress.from(e).exists { email =>
+        hasAcceptableDns(email).awaitOrElse(
+          90.millis,
+          "dns", {
+            logger.warn(
+              s"EmailAddressValidator.withAcceptableDns timeout! $e records should have been preloaded"
+            )
+            false
+          }
+        )
+      }
+    ) Valid
     else Invalid(ValidationError("error.email_acceptable"))
   }
+}
 
-  private val gmailDomains = Set("gmail.com", "googlemail.com")
+object EmailAddressValidator {
+  case class Acceptable(acceptable: EmailAddress)
 }

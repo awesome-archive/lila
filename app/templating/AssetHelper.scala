@@ -1,109 +1,91 @@
 package lila.app
 package templating
 
-import controllers.routes
 import play.api.mvc.RequestHeader
-import play.twirl.api.Html
 
 import lila.api.Context
-import lila.common.{ AssetVersion, ContentSecurityPolicy }
+import lila.app.ui.ScalatagsTemplate._
+import lila.common.{ AssetVersion, ContentSecurityPolicy, Nonce }
 
 trait AssetHelper { self: I18nHelper with SecurityHelper =>
 
-  def isProd: Boolean
+  private lazy val netDomain      = env.net.domain
+  private lazy val assetDomain    = env.net.assetDomain
+  private lazy val assetBaseUrl   = env.net.assetBaseUrl
+  private lazy val socketDomains  = env.net.socketDomains
+  private lazy val minifiedAssets = env.net.minifiedAssets
+  lazy val vapidPublicKey         = env.push.vapidPublicKey
 
-  val assetDomain = lila.api.Env.current.Net.AssetDomain
-  val socketDomain = lila.api.Env.current.Net.SocketDomain
-
-  val assetBaseUrl = s"//$assetDomain"
+  lazy val sameAssetDomain = netDomain.value == assetDomain.value
 
   def assetVersion = AssetVersion.current
 
   def assetUrl(path: String): String = s"$assetBaseUrl/assets/_$assetVersion/$path"
 
   def cdnUrl(path: String) = s"$assetBaseUrl$path"
-  def staticUrl(path: String) = s"$assetBaseUrl/assets/$path"
 
   def dbImageUrl(path: String) = s"$assetBaseUrl/image/$path"
 
-  def cssTag(name: String): Html = cssAt("stylesheets/" + name)
+  def cssTag(name: String)(implicit ctx: Context): Frag =
+    cssTagWithTheme(name, ctx.currentBg)
 
-  def cssTags(names: String*): Html = Html {
-    names.map { name =>
-      cssTag(name).body
-    } mkString ""
-  }
-  def cssTags(names: List[(String, Boolean)]): Html =
-    cssTags(names.collect { case (k, true) => k }: _*)
+  def cssTagWithTheme(name: String, theme: String): Frag =
+    cssAt(s"css/$name.$theme.${if (minifiedAssets) "min" else "dev"}.css")
 
-  def cssVendorTag(name: String) = cssAt("vendor/" + name)
+  def cssTagNoTheme(name: String): Frag =
+    cssAt(s"css/$name.${if (minifiedAssets) "min" else "dev"}.css")
 
-  def cssAt(path: String): Html = Html {
-    s"""<link href="${assetUrl(path)}" type="text/css" rel="stylesheet"/>"""
-  }
+  private def cssAt(path: String): Frag =
+    link(href := assetUrl(path), rel := "stylesheet")
 
-  def jsTag(name: String, async: Boolean = false) =
-    jsAt("javascripts/" + name, async = async)
+  // load scripts in <head> and always use defer
+  def jsAt(path: String): Frag = script(deferAttr, src := assetUrl(path))
 
-  def jsAt(path: String, async: Boolean = false): Html = Html {
-    val src = assetUrl(path)
-    s"""<script${if (async) " async defer" else ""} src="$src"></script>"""
-  }
+  def jsTag(name: String): Frag = jsAt(s"javascripts/$name")
 
-  val jQueryTag = Html {
-    s"""<script src="${staticUrl("javascripts/vendor/jquery.min.js")}"></script>"""
-  }
+  def jsModule(name: String): Frag =
+    jsAt(s"compiled/$name${minifiedAssets ?? ".min"}.js")
 
-  def roundTag = jsAt(s"compiled/lichess.round${isProd ?? (".min")}.js", async = true)
+  def depsTag = jsAt("compiled/deps.min.js")
 
-  val highchartsLatestTag = Html {
-    s"""<script src="${staticUrl("vendor/highcharts-4.2.5/highcharts.js")}"></script>"""
-  }
+  def roundTag                            = jsModule("round")
+  def roundNvuiTag(implicit ctx: Context) = ctx.blind option jsModule("round.nvui")
 
-  val highchartsMoreTag = Html {
-    s"""<script src="${staticUrl("vendor/highcharts-4.2.5/highcharts-more.js")}"></script>"""
-  }
+  def analyseTag                            = jsModule("analysisBoard")
+  def analyseNvuiTag(implicit ctx: Context) = ctx.blind option jsModule("analysisBoard.nvui")
 
-  val tagmanagerTag = Html {
-    s"""<script src="${staticUrl("vendor/tagmanager/tagmanager.js")}"></script>"""
-  }
+  def captchaTag          = jsModule("captcha")
+  def infiniteScrollTag   = jsModule("infiniteScroll")
+  def chessgroundTag      = jsAt("javascripts/vendor/chessground.min.js")
+  def cashTag             = jsAt("javascripts/vendor/cash.min.js")
+  def fingerprintTag      = jsAt("javascripts/fipr.js")
+  def tagifyTag           = jsAt("vendor/tagify/tagify.min.js")
+  def highchartsLatestTag = jsAt("vendor/highcharts-4.2.5/highcharts.js")
+  def highchartsMoreTag   = jsAt("vendor/highcharts-4.2.5/highcharts-more.js")
 
-  val typeaheadTag = Html {
-    s"""<script src="${staticUrl("javascripts/vendor/typeahead.bundle.min.js")}"></script>"""
-  }
-
-  val fingerprintTag = Html {
-    s"""<script async defer src="${staticUrl("javascripts/vendor/fp2.min.js")}"></script>"""
-  }
-
-  val flatpickrTag = Html {
-    s"""<script async defer src="${staticUrl("javascripts/vendor/flatpickr.min.js")}"></script>"""
-  }
-  def delayFlatpickrStart(implicit ctx: Context) = embedJs {
-    """$(function() { setTimeout(function() { $(".flatpickr").flatpickr(); }, 2000) });"""
-  }
-
-  val infiniteScrollTag = jsTag("vendor/jquery.infinitescroll.min.js")
-
-  def prismicJs(implicit ctx: Context) = Html {
-    isGranted(_.Prismic) ?? {
-      embedJsUnsafe("""window.prismic={endpoint:'https://lichess.prismic.io/api/v2'}""").body ++
-        """<script type="text/javascript" src="//static.cdn.prismic.io/prismic.min.js"></script>"""
+  def prismicJs(implicit ctx: Context): Frag =
+    raw {
+      isGranted(_.Prismic) ?? {
+        embedJsUnsafe("""window.prismic={endpoint:'https://lichess.prismic.io/api/v2'}""").render ++
+          """<script src="//static.cdn.prismic.io/prismic.min.js"></script>"""
+      }
     }
-  }
 
   def basicCsp(implicit req: RequestHeader): ContentSecurityPolicy = {
-    val assets = if (req.secure) "https://" + assetDomain else assetDomain
-    val socket = (if (req.secure) "wss://" else "ws://") + socketDomain + (if (socketDomain.contains(":")) "" else ":*")
+    val assets = if (req.secure) s"https://$assetDomain" else assetDomain.value
+    val sockets = socketDomains map { socketDomain =>
+      val protocol = if (req.secure) "wss://" else "ws://"
+      s"$protocol$socketDomain"
+    }
     ContentSecurityPolicy(
       defaultSrc = List("'self'", assets),
-      connectSrc = List("'self'", assets, socket, lila.api.Env.current.ExplorerEndpoint, lila.api.Env.current.TablebaseEndpoint),
-      styleSrc = List("'self'", "'unsafe-inline'", assets, "https://fonts.googleapis.com"),
-      fontSrc = List("'self'", assetDomain, "https://fonts.gstatic.com"),
-      frameSrc = List("'self'", assets, "https://www.youtube.com"),
+      connectSrc = "'self'" :: assets :: sockets ::: env.explorerEndpoint :: env.tablebaseEndpoint :: Nil,
+      styleSrc = List("'self'", "'unsafe-inline'", assets),
+      fontSrc = List("'self'", assetDomain.value, "https://fonts.gstatic.com"),
+      frameSrc = List("'self'", assets, "https://www.youtube.com", "https://player.twitch.tv"),
       workerSrc = List("'self'", assets),
       imgSrc = List("data:", "*"),
-      scriptSrc = List("'self'", "'unsafe-eval'", assets),
+      scriptSrc = List("'self'", assets),
       baseUri = List("'none'")
     )
   }
@@ -113,15 +95,22 @@ trait AssetHelper { self: I18nHelper with SecurityHelper =>
     ctx.nonce.fold(csp)(csp.withNonce(_))
   }
 
-  def embedJsUnsafe(js: String)(implicit ctx: Context): Html = Html {
-    val nonce = ctx.nonce ?? { nonce => s""" nonce="$nonce"""" }
-    s"""<script$nonce>$js</script>"""
-  }
-  def embedJsUnsafe(js: scalatags.Text.RawFrag)(implicit ctx: Context): scalatags.Text.RawFrag = scalatags.Text.all.raw {
-    val nonce = ctx.nonce ?? { nonce => s""" nonce="$nonce"""" }
-    s"""<script$nonce>$js</script>"""
-  }
+  def embedJsUnsafe(js: String)(implicit ctx: Context): Frag =
+    raw {
+      val nonce = ctx.nonce ?? { nonce =>
+        s""" nonce="$nonce""""
+      }
+      s"""<script$nonce>$js</script>"""
+    }
 
-  def embedJs(js: Html)(implicit ctx: Context): Html = embedJsUnsafe(js.body)
-  def embedJs(js: String)(implicit ctx: Context): Html = embedJsUnsafe(js)
+  def embedJsUnsafe(js: String, nonce: Nonce): Frag =
+    raw {
+      s"""<script nonce="$nonce">$js</script>"""
+    }
+
+  def embedJsUnsafeLoadThen(js: String)(implicit ctx: Context): Frag =
+    embedJsUnsafe(s"""lichess.load.then(()=>{$js})""")
+
+  def embedJsUnsafeLoadThen(js: String, nonce: Nonce): Frag =
+    embedJsUnsafe(s"""lichess.load.then(()=>{$js})""", nonce)
 }

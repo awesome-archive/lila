@@ -1,8 +1,7 @@
-import { h } from 'snabbdom'
-import { VNode } from 'snabbdom/vnode'
 import AnalyseCtrl from '../ctrl';
-import { spinner, bind } from '../util';
+import { h, VNode } from 'snabbdom';
 import { Prop, prop, defined } from 'common';
+import { spinner, bind, onInsert } from '../util';
 
 export interface ServerEvalCtrl {
   requested: Prop<boolean>;
@@ -15,34 +14,26 @@ export interface ServerEvalCtrl {
   lastPly: Prop<number | false>;
 }
 
-const li = window.lichess;
-
 export function ctrl(root: AnalyseCtrl, chapterId: () => string): ServerEvalCtrl {
-
   const requested = prop(false),
-  lastPly = prop<number | false>(false),
-  chartEl = prop<HTMLElement | null>(null);
+    lastPly = prop<number | false>(false),
+    chartEl = prop<HTMLElement | null>(null);
 
   function unselect(chart) {
     chart.getSelectedPoints().forEach(p => p.select(false));
   }
 
-  li.pubsub.on('analysis.change', (_fen: string, _path: string, mainlinePly: number | false) => {
-    if (!li.advantageChart || lastPly() === mainlinePly) return;
+  lichess.pubsub.on('analysis.change', (_fen: string, _path: string, mainlinePly: number | false) => {
+    if (!lichess.advantageChart || lastPly() === mainlinePly) return;
     const lp = lastPly(typeof mainlinePly === 'undefined' ? lastPly() : mainlinePly),
-    el = chartEl();
-    if (el && window.Highcharts) {
-      const $chart = $(el);
-      if ($chart.length) {
-        const chart = $chart.highcharts();
-        if (chart) {
-          if (lp === false) unselect(chart);
-          else {
-            const point = chart.series[0].data[lp - 1 - root.tree.root.ply];
-            if (defined(point)) point.select();
-            else unselect(chart);
-          }
-        } else lastPly(false);
+      el = chartEl(),
+      chart = el && el['highcharts'];
+    if (chart) {
+      if (lp === false) unselect(chart);
+      else {
+        const point = chart.series[0].data[lp - 1 - root.tree.root.ply];
+        if (defined(point)) point.select();
+        else unselect(chart);
       }
     } else lastPly(false);
   });
@@ -55,7 +46,7 @@ export function ctrl(root: AnalyseCtrl, chapterId: () => string): ServerEvalCtrl
     },
     chapterId,
     onMergeAnalysisData() {
-      if (li.advantageChart) li.advantageChart.update(root.data);
+      if (lichess.advantageChart) lichess.advantageChart.update(root.data);
     },
     request() {
       root.socket.send('requestAnalysis', chapterId());
@@ -63,54 +54,68 @@ export function ctrl(root: AnalyseCtrl, chapterId: () => string): ServerEvalCtrl
     },
     requested,
     lastPly,
-    chartEl
+    chartEl,
   };
 }
 
 export function view(ctrl: ServerEvalCtrl): VNode {
-
   const analysis = ctrl.root.data.analysis;
 
+  if (!ctrl.root.showComputer()) return disabled();
   if (!analysis) return ctrl.requested() ? requested() : requestButton(ctrl);
 
-  return h('div.server_eval.ready.' + analysis.id, {
-    hook: {
-      insert(vnode) {
+  return h(
+    'div.study__server-eval.ready.' + analysis.id,
+    {
+      hook: onInsert(el => {
         ctrl.lastPly(false);
-        li.requestIdleCallback(() => {
-          li.loadScript('javascripts/chart/acpl.js').then(() => {
-            li.advantageChart(ctrl.root.data, ctrl.root.trans, vnode.elm as HTMLElement);
-            ctrl.chartEl(vnode.elm as HTMLElement);
-          });
-        });
-      }
-    }
-  }, [h('div.message', spinner())]);
+        lichess.requestIdleCallback(
+          () =>
+            lichess.loadScript('javascripts/chart/acpl.js').then(() => {
+              lichess.advantageChart!(ctrl.root.data, ctrl.root.trans, el);
+              ctrl.chartEl(el);
+            }),
+          800
+        );
+      }),
+    },
+    [h('div.study__message', spinner())]
+  );
+}
+
+function disabled(): VNode {
+  return h('div.study__server-eval.disabled.padded', 'You disabled computer analysis.');
 }
 
 function requested(): VNode {
-  return h('div.server_eval.requested',
-    h('div.message', spinner()));
+  return h('div.study__server-eval.requested.padded', spinner());
 }
 
 function requestButton(ctrl: ServerEvalCtrl) {
-
-  return h('div.server_eval', [
-    h('div.message',
-      ctrl.root.mainline.length < 5 ? h('p', 'The study is too short to be analysed.') : (
-        !ctrl.root.study!.members.canContribute() ? h('p', 'Only the study contributors can request a computer analysis') : [
+  const root = ctrl.root;
+  return h(
+    'div.study__message',
+    root.mainline.length < 5
+      ? h('p', root.trans.noarg('theChapterIsTooShortToBeAnalysed'))
+      : !root.study!.members.canContribute()
+      ? [root.trans.noarg('onlyContributorsCanRequestAnalysis')]
+      : [
           h('p', [
-            'Get a full server-side computer analysis of the main line.',
+            root.trans.noarg('getAFullComputerAnalysis'),
             h('br'),
-            'Make sure the chapter is complete, for you can only request analysis once.'
+            root.trans.noarg('makeSureTheChapterIsComplete'),
           ]),
-          h('a.button.text.request', {
-            attrs: {
-              'data-icon': '',
-              disabled: ctrl.root.mainline.length < 5
+          h(
+            'a.button.text',
+            {
+              attrs: {
+                'data-icon': '',
+                disabled: root.mainline.length < 5,
+              },
+              hook: bind('click', ctrl.request, root.redraw),
             },
-            hook: bind('click', ctrl.request, ctrl.root.redraw)
-          }, ctrl.root.trans.noarg('requestAComputerAnalysis'))
-        ])
-    )]);
+            root.trans.noarg('requestAComputerAnalysis')
+          ),
+        ]
+  );
 }

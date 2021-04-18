@@ -1,351 +1,395 @@
 package lila.round
 
-import scala.concurrent.duration._
-
-import akka.actor._
-import akka.pattern.{ ask, pipe }
-import chess.{ Color, White, Black }
-import play.api.libs.iteratee._
-import play.api.libs.json._
-
 import actorApi._
-import lila.chat.Chat
-import lila.common.LightUser
-import lila.game.actorApi.{ StartGame, UserStartGame }
-import lila.game.{ Game, GameRepo, Event }
-import lila.hub.actorApi.Deploy
-import lila.hub.actorApi.game.ChangeFeatured
-import lila.hub.actorApi.round.{ IsOnGame, TourStanding }
-import lila.hub.actorApi.simul.GetHostIds
-import lila.hub.actorApi.tv.{ Select => TvSelect }
-import lila.hub.Trouper
-import lila.socket._
-import lila.socket.actorApi.{ Connected => _, _ }
-import lila.socket.Socket
-import makeTimeout.short
+import actorApi.round._
+import akka.actor.{ ActorSystem, Cancellable, CoordinatedShutdown, Scheduler }
+import chess.format.Uci
+import chess.{ Black, Centis, Color, MoveMetrics, Speed, White }
+import play.api.libs.json._
+import scala.concurrent.duration._
+import scala.concurrent.ExecutionContext
 
-private[round] final class RoundSocket(
-    dependencies: RoundSocket.Dependencies,
-    gameId: Game.ID,
-    history: History,
-    keepMeAlive: () => Unit
-) extends SocketTrouper[Member](dependencies.system, dependencies.uidTtl) {
+import lila.chat.{ BusChan, Chat }
+import lila.common.{ Bus, IpAddress, Lilakka }
+import lila.game.Game.{ FullId, PlayerId }
+import lila.game.{ Event, Game, Pov }
+import lila.hub.actorApi.map.{ Exists, Tell, TellAll, TellIfExists, TellMany }
+import lila.hub.actorApi.round.{ Abort, Berserk, RematchNo, RematchYes, Resign, TourStanding }
+import lila.hub.actorApi.socket.remote.TellSriIn
+import lila.hub.actorApi.tv.TvSelect
+import lila.hub.DuctConcMap
+import lila.room.RoomSocket.{ Protocol => RP, _ }
+import lila.socket.RemoteSocket.{ Protocol => P, _ }
+import lila.socket.Socket.{ makeMessage, SocketVersion }
+import lila.user.User
 
-  import dependencies._
+final class RoundSocket(
+    remoteSocketApi: lila.socket.RemoteSocket,
+    roundDependencies: RoundDuct.Dependencies,
+    proxyDependencies: GameProxy.Dependencies,
+    scheduleExpiration: ScheduleExpiration,
+    tournamentActor: lila.hub.actors.TournamentApi,
+    messenger: Messenger,
+    goneWeightsFor: Game => Fu[(Float, Float)],
+    shutdown: CoordinatedShutdown
+)(implicit
+    ec: ExecutionContext,
+    system: ActorSystem
+) {
 
-  private var hasAi = false
-  private var mightBeSimul = true // until proven false
-  private var chatIds = RoundSocket.ChatIds(
-    priv = Chat.Id(gameId), // until replaced with tourney/simul chat
-    pub = Chat.Id(s"$gameId/w")
-  )
-  private var tournamentId = none[String] // until set, to listen to standings
+  import RoundSocket._
 
-  private var delayedCrowdNotification = false
+  private var stopping = false
 
-  private final class Player(color: Color) {
-
-    // when the player has been seen online for the last time
-    private var time: Long = nowMillis
-    // wether the player closed the window intentionally
-    private var bye: Int = 0
-    // connected as a bot
-    private var botConnected: Boolean = false
-
-    var userId = none[String]
-
-    def ping: Unit = {
-      isGone foreach { _ ?? notifyGone(color, false) }
-      if (bye > 0) bye = bye - 1
-      time = nowMillis
-    }
-    def setBye: Unit = {
-      bye = 3
-    }
-    private def isBye = bye > 0
-
-    private def isHostingSimul: Fu[Boolean] = userId.ifTrue(mightBeSimul) ?? { u =>
-      lilaBus.ask[Set[String]]('simulGetHosts)(GetHostIds).map(_ contains u)
-    }
-
-    def isGone: Fu[Boolean] = {
-      time < (nowMillis - (if (isBye) ragequitTimeout else disconnectTimeout).toMillis) &&
-        !botConnected
-    } ?? !isHostingSimul
-
-    def setBotConnected(v: Boolean) =
-      botConnected = v
-
-    def isBotConnected = botConnected
-  }
-
-  private val whitePlayer = new Player(White)
-  private val blackPlayer = new Player(Black)
-
-  buscriptions.subAll
-  GameRepo game gameId map SetGame.apply foreach this.!
-
-  override def stop(): Unit = {
-    buscriptions.unsubAll
-    super.stop()
-  }
-
-  private object buscriptions {
-
-    private var classifiers = collection.mutable.Set.empty[Symbol]
-
-    private def sub(classifier: Symbol) = {
-      lilaBus.subscribe(RoundSocket.this, classifier)
-      classifiers += classifier
-    }
-
-    def unsubAll = {
-      lilaBus.unsubscribe(RoundSocket.this, classifiers.toSeq)
-      classifiers.clear
-    }
-
-    def subAll = {
-      tv
-      chat
-      tournament
-    }
-
-    def tv = members.flatMap { case (_, m) => m.userTv }.toSet foreach { (userId: String) =>
-      sub(Symbol(s"userStartGame:$userId"))
-    }
-
-    def chat = chatIds.all foreach { chatId =>
-      sub(lila.chat.Chat classify chatId)
-    }
-
-    def tournament = tournamentId foreach { id =>
-      sub(Symbol(s"tour-standing-$id"))
+  Lilakka.shutdown(shutdown, _.PhaseServiceUnbind, "Stop round socket") { () =>
+    stopping = true
+    rounds.tellAllWithAck(RoundDuct.LilaStop.apply) map { nb =>
+      Lilakka.logger.info(s"$nb round ducts have stopped")
     }
   }
 
-  def receiveSpecific: Trouper.Receive = ({
+  def getGame(gameId: Game.ID): Fu[Option[Game]] =
+    rounds.getOrMake(gameId).getGame addEffect { g =>
+      if (g.isEmpty) finishRound(Game.Id(gameId))
+    }
+  def getGames(gameIds: List[Game.ID]): Fu[List[(Game.ID, Option[Game])]] =
+    gameIds.map { id =>
+      rounds.getOrMake(id).getGame dmap { id -> _ }
+    }.sequenceFu
 
-    case SetGame(Some(game)) =>
-      hasAi = game.hasAi
-      whitePlayer.userId = game.player(White).userId
-      blackPlayer.userId = game.player(Black).userId
-      mightBeSimul = game.isSimul
-      game.tournamentId orElse game.simulId map Chat.Id.apply foreach { chatId =>
-        chatIds = chatIds.copy(priv = chatId)
-        buscriptions.chat
-      }
-      game.tournamentId foreach { tourId =>
-        tournamentId = tourId.some
-        buscriptions.tournament
-      }
+  def gameIfPresent(gameId: Game.ID): Fu[Option[Game]] = rounds.getIfPresent(gameId).??(_.getGame)
 
-    // from lilaBus 'startGame
-    // sets definitive user ids
-    // in case one joined after the socket creation
-    case StartGame(game) => this ! SetGame(game.some)
+  // get the proxied version of the game
+  def upgradeIfPresent(game: Game): Fu[Game] =
+    rounds.getIfPresent(game.id).fold(fuccess(game))(_.getGame.dmap(_ | game))
 
-    case d: Deploy =>
-      onDeploy(d)
-      history.enablePersistence
+  // update the proxied game
+  def updateIfPresent(gameId: Game.ID)(f: Game => Game): Funit =
+    rounds.getIfPresent(gameId) ?? {
+      _ updateGame f
+    }
 
-    case BotConnected(color, v) =>
-      playerDo(color, _ setBotConnected v)
-      notifyCrowd
-
-    case Bye(color) => playerDo(color, _.setBye)
-
-    case IsGone(color, promise) => promise completeWith playerGet(color, _.isGone)
-
-    case IsOnGame(color, promise) => promise success ownerIsHere(color)
-
-    case GetSocketStatus(promise) =>
-      playerGet(White, _.isGone) zip playerGet(Black, _.isGone) foreach {
-        case (whiteIsGone, blackIsGone) => promise success SocketStatus(
-          version = history.getVersion,
-          whiteOnGame = ownerIsHere(White),
-          whiteIsGone = whiteIsGone,
-          blackOnGame = ownerIsHere(Black),
-          blackIsGone = blackIsGone
-        )
-      }
-
-    case Join(uid, user, color, playerId, onTv, version, mobile, promise) => {
-      val (enumerator, channel) = Concurrent.broadcast[JsValue]
-      val member = Member(channel, user, color, playerId, onTv.map(_.userId))
-      addMember(uid, member)
-      notifyCrowd
-      if (playerId.isDefined) playerDo(color, _.ping)
-      val reloadTvEvent = onTv ?? {
-        case UserTv(_, reload) => reload map {
-          case true => resyncMessage.some
-          case false =>
-            buscriptions.tv // reload buscriptions
-            none
+  val rounds = new DuctConcMap[RoundDuct](
+    mkDuct = id => {
+      val proxy = new GameProxy(id, proxyDependencies)
+      val duct = new RoundDuct(
+        dependencies = roundDependencies,
+        gameId = id,
+        socketSend = sendForGameId(id)
+      )(ec, proxy)
+      terminationDelay schedule Game.Id(id)
+      duct.getGame dforeach {
+        _ foreach { game =>
+          scheduleExpiration(game)
+          goneWeightsFor(game) dforeach { w =>
+            duct ! RoundDuct.SetGameInfo(game, w)
+          }
         }
       }
-      val events = version.fold(history.getRecentEvents(5).some) { v =>
-        history.getEventsSince(v, lila.mon.round.history(mobile).some)
-      }
-
-      val initialMsgs = events.fold(resyncMessage.some) {
-        batchMsgs(member, _)
-      } map { m => Enumerator(m: JsValue) }
-
-      val fullEnumerator = lila.common.Iteratee.prependFu(
-        reloadTvEvent.map(_.toList),
-        initialMsgs.fold(enumerator) { _ >>> enumerator }
-      )
-
-      promise success Connected(fullEnumerator, member)
-    }
-
-    // see History.versionCheck
-    case VersionCheck(version, member, mobile) =>
-      // logger.info(s"Check mobile:$mobile $version / ${history.getVersion} $gameId $member")
-      history versionCheck version match {
-        case None =>
-          lila.mon.round.history(mobile).versionCheck.getEventsTooFar()
-          logger.info(s"Lost mobile:$mobile $version < ${history.getVersion} $gameId $member")
-          member push resyncMessage
-        case Some(Nil) => // all good, nothing to do
-        case Some(evs) =>
-          lila.mon.round.history(mobile).getEventsDelta(evs.size)
-          lila.mon.round.history(mobile).versionCheck.lateClient()
-          logger.info(s"Late mobile:$mobile $version < ${evs.lastOption.??(_.version)} $gameId $member")
-          batchMsgs(member, evs) foreach member.push
-      }
-
-    case eventList: EventList => notify(eventList.events)
-
-    case lila.chat.actorApi.ChatLine(chatId, line) => notify(List(line match {
-      case l: lila.chat.UserLine => Event.UserMessage(l, chatId == chatIds.pub)
-      case l: lila.chat.PlayerLine => Event.PlayerMessage(l)
-    }))
-
-    case a: lila.analyse.actorApi.AnalysisProgress =>
-      import lila.analyse.{ JsonView => analysisJson }
-      notifyAll("analysisProgress", Json.obj(
-        "analysis" -> analysisJson.bothPlayers(a.game, a.analysis),
-        "tree" -> TreeBuilder(
-          id = a.analysis.id,
-          pgnMoves = a.game.pgnMoves,
-          variant = a.variant,
-          analysis = a.analysis.some,
-          initialFen = a.initialFen,
-          withFlags = JsonView.WithFlags(),
-          clocks = none
-        )
-      ))
-
-    case ChangeFeatured(_, msg) => foreachWatcher(_ push msg)
-
-    case TvSelect(msg) => foreachWatcher(_ push msg)
-
-    case UserStartGame(userId, game) => foreachWatcher { m =>
-      if (m.onUserTv(userId) && !m.userId.exists(game.userIds.contains))
-        m push makeMessage("resync")
-    }
-
-    case NotifyCrowd =>
-      delayedCrowdNotification = false
-      showSpectators(lightUser)(members.values.filter(_.watcher)) foreach { spectators =>
-        val event = Event.Crowd(
-          white = ownerIsHere(White),
-          black = ownerIsHere(Black),
-          watchers = spectators
-        )
-        notifyAll(event.typ, event.data)
-      }
-
-    case TourStanding(json) => notifyOwners("tourStanding", json)
-
-  }: Trouper.Receive) orElse lila.chat.Socket.out(
-    send = (t, d, _) => notifyAll(t, d)
+      duct
+    },
+    initialCapacity = 65536
   )
 
-  override def broom = {
-    super.broom
-    if (members.nonEmpty) keepMeAlive()
-    if (!hasAi) Color.all foreach { c =>
-      playerGet(c, _.isGone) foreach { _ ?? notifyGone(c, true) }
+  private def tellRound(gameId: Game.Id, msg: Any): Unit = rounds.tell(gameId.value, msg)
+
+  private lazy val roundHandler: Handler = {
+    case Protocol.In.PlayerMove(fullId, uci, blur, lag) if !stopping =>
+      tellRound(fullId.gameId, HumanPlay(fullId.playerId, uci, blur, lag, none))
+    case Protocol.In.PlayerDo(id, tpe) if !stopping =>
+      tpe match {
+        case "moretime"     => tellRound(id.gameId, Moretime(id.playerId))
+        case "rematch-yes"  => tellRound(id.gameId, RematchYes(id.playerId.value))
+        case "rematch-no"   => tellRound(id.gameId, RematchNo(id.playerId.value))
+        case "takeback-yes" => tellRound(id.gameId, TakebackYes(id.playerId))
+        case "takeback-no"  => tellRound(id.gameId, TakebackNo(id.playerId))
+        case "draw-yes"     => tellRound(id.gameId, DrawYes(id.playerId))
+        case "draw-no"      => tellRound(id.gameId, DrawNo(id.playerId))
+        case "draw-claim"   => tellRound(id.gameId, DrawClaim(id.playerId))
+        case "resign"       => tellRound(id.gameId, Resign(id.playerId.value))
+        case "resign-force" => tellRound(id.gameId, ResignForce(id.playerId))
+        case "draw-force"   => tellRound(id.gameId, DrawForce(id.playerId))
+        case "abort"        => tellRound(id.gameId, Abort(id.playerId.value))
+        case "outoftime"    => tellRound(id.gameId, QuietFlag) // mobile app BC
+        case t              => logger.warn(s"Unhandled round socket message: $t")
+      }
+    case Protocol.In.Flag(gameId, color, fromPlayerId) => tellRound(gameId, ClientFlag(color, fromPlayerId))
+    case Protocol.In.PlayerChatSay(id, Right(color), msg) =>
+      gameIfPresent(id.value) foreach {
+        _ foreach {
+          messenger.owner(_, color, msg).unit
+        }
+      }
+    case Protocol.In.PlayerChatSay(id, Left(userId), msg) =>
+      messenger.owner(id, userId, msg).unit
+    case Protocol.In.WatcherChatSay(id, userId, msg) =>
+      messenger.watcher(id, userId, msg).unit
+    case RP.In.ChatTimeout(roomId, modId, suspect, reason, text) =>
+      messenger.timeout(Chat.Id(s"$roomId/w"), modId, suspect, reason, text).unit
+    case Protocol.In.Berserk(gameId, userId) => tournamentActor ! Berserk(gameId.value, userId)
+    case Protocol.In.PlayerOnlines(onlines) =>
+      onlines foreach {
+        case (gameId, Some(on)) =>
+          tellRound(gameId, on)
+          terminationDelay cancel gameId
+        case (gameId, _) =>
+          if (rounds exists gameId.value) terminationDelay schedule gameId
+      }
+    case Protocol.In.Bye(fullId) => tellRound(fullId.gameId, ByePlayer(fullId.playerId))
+    case RP.In.TellRoomSri(_, P.In.TellSri(_, _, tpe, _)) =>
+      logger.warn(s"Unhandled round socket message: $tpe")
+    case hold: Protocol.In.HoldAlert => tellRound(hold.fullId.gameId, hold)
+    case r: Protocol.In.SelfReport   => Bus.publish(r, "selfReport")
+    case P.In.TellSri(sri, userId, tpe, msg) => // eval cache
+      Bus.publish(TellSriIn(sri.value, userId, msg), s"remoteSocketIn:$tpe")
+    case RP.In.SetVersions(versions) =>
+      versions foreach { case (roomId, version) =>
+        rounds.tell(roomId, SetVersion(version))
+      }
+      send(Protocol.Out.versioningReady)
+    case P.In.Ping(id) => send(P.Out.pong(id))
+    case P.In.WsBoot =>
+      logger.warn("Remote socket boot")
+      // schedule termination for all game ducts
+      // until players actually reconnect
+      rounds foreachKey { id =>
+        terminationDelay schedule Game.Id(id)
+      }
+      rounds.tellAll(RoundDuct.WsBoot)
+  }
+
+  private def finishRound(gameId: Game.Id): Unit =
+    rounds.terminate(gameId.value, _ ! RoundDuct.Stop)
+
+  private lazy val send: Sender = remoteSocketApi.makeSender("r-out", parallelism = 8)
+
+  private lazy val sendForGameId: Game.ID => String => Unit = gameId => msg => send.sticky(gameId, msg)
+
+  remoteSocketApi.subscribeRoundRobin("r-in", Protocol.In.reader, parallelism = 8)(
+    roundHandler orElse remoteSocketApi.baseHandler
+  ) >>- send(P.Out.boot)
+
+  Bus.subscribeFun("tvSelect", "roundSocket", "tourStanding", "startGame", "finishGame") {
+    case TvSelect(gameId, speed, json) => sendForGameId(gameId)(Protocol.Out.tvSelect(gameId, speed, json))
+    case Tell(gameId, e @ BotConnected(color, v)) =>
+      rounds.tell(gameId, e)
+      sendForGameId(gameId)(Protocol.Out.botConnected(gameId, color, v))
+    case Tell(gameId, msg)          => rounds.tell(gameId, msg)
+    case TellIfExists(gameId, msg)  => rounds.tellIfPresent(gameId, msg)
+    case TellMany(gameIds, msg)     => rounds.tellIds(gameIds, msg)
+    case TellAll(msg)               => rounds.tellAll(msg)
+    case Exists(gameId, promise)    => promise success rounds.exists(gameId)
+    case TourStanding(tourId, json) => send(Protocol.Out.tourStanding(tourId, json))
+    case lila.game.actorApi.StartGame(game) if game.hasClock =>
+      game.userIds.some.filter(_.nonEmpty) foreach { usersPlaying =>
+        sendForGameId(game.id)(Protocol.Out.startGame(usersPlaying))
+      }
+    case lila.game.actorApi.FinishGame(game, _, _) if game.hasClock =>
+      game.userIds.some.filter(_.nonEmpty) foreach { usersPlaying =>
+        sendForGameId(game.id)(Protocol.Out.finishGame(game.id, game.winnerColor, usersPlaying))
+      }
+  }
+
+  {
+    import lila.chat.actorApi._
+    Bus.subscribeFun(BusChan.Round.chan, BusChan.Global.chan) {
+      case ChatLine(Chat.Id(id), l) =>
+        val line = RoundLine(l, id endsWith "/w")
+        rounds.tellIfPresent(if (line.watcher) id take Game.gameIdSize else id, line)
+      case OnTimeout(Chat.Id(id), userId) =>
+        send(RP.Out.tellRoom(RoomId(id take Game.gameIdSize), makeMessage("chat_timeout", userId)))
+      case OnReinstate(Chat.Id(id), userId) =>
+        send(RP.Out.tellRoom(RoomId(id take Game.gameIdSize), makeMessage("chat_reinstate", userId)))
     }
   }
 
-  override protected def afterQuit(uid: Socket.Uid, member: Member) = notifyCrowd
-
-  def notifyCrowd: Unit = if (isAlive) {
-    if (!delayedCrowdNotification) {
-      delayedCrowdNotification = true
-      system.scheduler.scheduleOnce(1 second)(this ! NotifyCrowd)
-    }
+  system.scheduler.scheduleWithFixedDelay(25 seconds, tickInterval) { () =>
+    rounds.tellAll(RoundDuct.Tick)
+  }
+  system.scheduler.scheduleWithFixedDelay(60 seconds, 60 seconds) { () =>
+    lila.mon.round.ductCount.update(rounds.size).unit
   }
 
-  def notify(events: Events): Unit = {
-    val vevents = history addEvents events
-    members.foreachValue { m =>
-      batchMsgs(m, vevents) foreach m.push
-    }
-  }
-
-  def batchMsgs(member: Member, vevents: List[VersionedEvent]) = vevents match {
-    case Nil => None
-    case List(one) => one.jsFor(member).some
-    case many => makeMessage("b", many map (_ jsFor member)).some
-  }
-
-  def notifyOwner[A: Writes](color: Color, t: String, data: A) =
-    withOwnerOf(color) {
-      _ push makeMessage(t, data)
-    }
-
-  def notifyGone(color: Color, gone: Boolean): Unit = {
-    notifyOwner(!color, "gone", gone)
-  }
-
-  def withOwnerOf(color: Color)(f: Member => Unit) =
-    members.foreachValue { m =>
-      if (m.owner && m.color == color) f(m)
-    }
-
-  def notifyOwners[A: Writes](t: String, data: A) =
-    members.foreachValue { m =>
-      if (m.owner) m push makeMessage(t, data)
-    }
-
-  def ownerIsHere(color: Color) = playerGet(color, _.isBotConnected) ||
-    members.values.exists { m =>
-      m.owner && m.color == color
-    }
-
-  def ownerOf(uid: Socket.Uid): Option[Member] =
-    members get uid.value filter (_.owner)
-
-  def foreachWatcher(f: Member => Unit): Unit = members.foreachValue { m =>
-    if (m.watcher) f(m)
-  }
-
-  private def playerGet[A](color: Color, getter: Player => A): A =
-    getter(color.fold(whitePlayer, blackPlayer))
-
-  def playerDo(color: Color, effect: Player => Unit): Unit =
-    effect(color.fold(whitePlayer, blackPlayer))
+  private val terminationDelay = new TerminationDelay(system.scheduler, 1 minute, finishRound)
 }
 
 object RoundSocket {
 
-  case class ChatIds(priv: Chat.Id, pub: Chat.Id) {
-    def all = Seq(priv, pub)
-    def update(g: Game) =
-      g.tournamentId.map { id => copy(priv = Chat.Id(id)) } orElse
-        g.simulId.map { id => copy(priv = Chat.Id(id)) } getOrElse
-        this
+  val tickSeconds       = 5
+  val tickInterval      = tickSeconds.seconds
+  val ragequitTimeout   = 10.seconds
+  val disconnectTimeout = 40.seconds
+
+  def povDisconnectTimeout(pov: Pov): FiniteDuration =
+    disconnectTimeout * {
+      pov.game.speed match {
+        case Speed.Classical => 3
+        case Speed.Rapid     => 2
+        case _               => 1
+      }
+    } / {
+      import chess.variant._
+      (pov.game.chess.board.materialImbalance, pov.game.variant) match {
+        case (_, Antichess | Crazyhouse | Horde)                                   => 1
+        case (i, _) if (pov.color.white && i <= -4) || (pov.color.black && i >= 4) => 3
+        case _                                                                     => 1
+      }
+    } / {
+      if (pov.player.hasUser) 1 else 2
+    }
+
+  object Protocol {
+
+    object In {
+
+      case class PlayerOnlines(onlines: Iterable[(Game.Id, Option[RoomCrowd])])        extends P.In
+      case class PlayerDo(fullId: FullId, tpe: String)                                 extends P.In
+      case class PlayerMove(fullId: FullId, uci: Uci, blur: Boolean, lag: MoveMetrics) extends P.In
+      case class PlayerChatSay(gameId: Game.Id, userIdOrColor: Either[User.ID, Color], msg: String)
+          extends P.In
+      case class WatcherChatSay(gameId: Game.Id, userId: User.ID, msg: String)                    extends P.In
+      case class Bye(fullId: FullId)                                                              extends P.In
+      case class HoldAlert(fullId: FullId, ip: IpAddress, mean: Int, sd: Int)                     extends P.In
+      case class Flag(gameId: Game.Id, color: Color, fromPlayerId: Option[PlayerId])              extends P.In
+      case class Berserk(gameId: Game.Id, userId: User.ID)                                        extends P.In
+      case class SelfReport(fullId: FullId, ip: IpAddress, userId: Option[User.ID], name: String) extends P.In
+
+      val reader: P.In.Reader = raw =>
+        raw.path match {
+          case "r/ons" =>
+            PlayerOnlines {
+              P.In.commas(raw.args) map {
+                _ splitAt Game.gameIdSize match {
+                  case (gameId, cs) =>
+                    (
+                      Game.Id(gameId),
+                      if (cs.isEmpty) None else Some(RoomCrowd(cs(0) == '+', cs(1) == '+'))
+                    )
+                }
+              }
+            }.some
+          case "r/do" =>
+            raw.get(2) { case Array(fullId, payload) =>
+              for {
+                obj <- Json.parse(payload).asOpt[JsObject]
+                tpe <- obj str "t"
+              } yield PlayerDo(FullId(fullId), tpe)
+            }
+          case "r/move" =>
+            raw.get(5) { case Array(fullId, uciS, blurS, lagS, mtS) =>
+              Uci(uciS) map { uci =>
+                PlayerMove(FullId(fullId), uci, P.In.boolean(blurS), MoveMetrics(centis(lagS), centis(mtS)))
+              }
+            }
+          case "chat/say" =>
+            raw.get(3) { case Array(roomId, author, msg) =>
+              PlayerChatSay(Game.Id(roomId), readColor(author).toRight(author), msg).some
+            }
+          case "chat/say/w" =>
+            raw.get(3) { case Array(roomId, userId, msg) =>
+              WatcherChatSay(Game.Id(roomId), userId, msg).some
+            }
+          case "r/berserk" =>
+            raw.get(2) { case Array(gameId, userId) =>
+              Berserk(Game.Id(gameId), userId).some
+            }
+          case "r/bye" => Bye(Game.FullId(raw.args)).some
+          case "r/hold" =>
+            raw.get(4) { case Array(fullId, ip, meanS, sdS) =>
+              for {
+                mean <- meanS.toIntOption
+                sd   <- sdS.toIntOption
+                ip   <- IpAddress.from(ip)
+              } yield HoldAlert(FullId(fullId), ip, mean, sd)
+            }
+          case "r/report" =>
+            raw.get(4) { case Array(fullId, ip, user, name) =>
+              IpAddress.from(ip) map { ip =>
+                SelfReport(FullId(fullId), ip, P.In.optional(user), name)
+              }
+            }
+          case "r/flag" =>
+            raw.get(3) { case Array(gameId, color, playerId) =>
+              readColor(color) map {
+                Flag(Game.Id(gameId), _, P.In.optional(playerId) map PlayerId.apply)
+              }
+            }
+          case _ => RP.In.reader(raw)
+        }
+
+      private def centis(s: String): Option[Centis] =
+        if (s == "-") none
+        else s.toIntOption map Centis.apply
+
+      private def readColor(s: String) =
+        if (s == "w") Some(White)
+        else if (s == "b") Some(Black)
+        else None
+    }
+
+    object Out {
+
+      def resyncPlayer(fullId: FullId)        = s"r/resync/player $fullId"
+      def gone(fullId: FullId, gone: Boolean) = s"r/gone $fullId ${P.Out.boolean(gone)}"
+      def goneIn(fullId: FullId, millis: Long) = {
+        val seconds = Math.ceil(millis / 1000d / tickSeconds).toInt * tickSeconds
+        s"r/goneIn $fullId $seconds"
+      }
+
+      def tellVersion(roomId: RoomId, version: SocketVersion, e: Event) = {
+        val flags = new StringBuilder(2)
+        if (e.watcher) flags += 's'
+        else if (e.owner) flags += 'p'
+        else
+          e.only.map(_.fold('w', 'b')).orElse {
+            e.moveBy.map(_.fold('W', 'B'))
+          } foreach flags.+=
+        if (e.troll) flags += 't'
+        if (flags.isEmpty) flags += '-'
+        s"r/ver $roomId $version $flags ${e.typ} ${e.data}"
+      }
+
+      def tvSelect(gameId: Game.ID, speed: chess.Speed, data: JsObject) =
+        s"tv/select $gameId ${speed.id} ${Json stringify data}"
+
+      def botConnected(gameId: Game.ID, color: Color, v: Boolean) =
+        s"r/bot/online $gameId ${P.Out.color(color)} ${P.Out.boolean(v)}"
+
+      def tourStanding(tourId: String, data: JsValue) =
+        s"r/tour/standing $tourId ${Json stringify data}"
+
+      def startGame(users: List[User.ID]) = s"r/start ${P.Out.commas(users)}"
+      def finishGame(gameId: Game.ID, winner: Option[Color], users: List[User.ID]) =
+        s"r/finish $gameId ${P.Out.color(winner)} ${P.Out.commas(users)}"
+
+      def versioningReady = "r/versioning-ready"
+    }
   }
 
-  private[round] case class Dependencies(
-      system: ActorSystem,
-      lightUser: LightUser.Getter,
-      uidTtl: FiniteDuration,
-      disconnectTimeout: FiniteDuration,
-      ragequitTimeout: FiniteDuration
-  )
+  final private class TerminationDelay(
+      scheduler: Scheduler,
+      duration: FiniteDuration,
+      terminate: Game.Id => Unit
+  )(implicit ec: scala.concurrent.ExecutionContext) {
+    import java.util.concurrent.ConcurrentHashMap
+
+    private[this] val terminations = new ConcurrentHashMap[String, Cancellable](65536)
+
+    def schedule(gameId: Game.Id): Unit =
+      terminations
+        .compute(
+          gameId.value,
+          (id, canc) => {
+            Option(canc).foreach(_.cancel())
+            scheduler.scheduleOnce(duration) {
+              terminations remove id
+              terminate(Game.Id(id))
+            }
+          }
+        )
+        .unit
+
+    def cancel(gameId: Game.Id): Unit =
+      Option(terminations remove gameId.value).foreach(_.cancel())
+  }
 }

@@ -1,123 +1,244 @@
-import { h, thunk } from 'snabbdom';
-import { VNode } from 'snabbdom/vnode';
-import { dataIcon, innerHTML } from '../util';
-import { Controller } from '../interfaces';
+import { Controller, Puzzle, PuzzleGame, MaybeVNode, PuzzleDifficulty } from '../interfaces';
+import { dataIcon, onInsert, bind } from '../util';
+import { h, VNode } from 'snabbdom';
+import { numberFormat } from 'common/number';
+import PuzzleStreak from '../streak';
 
-// useful in translation arguments
-function strong(txt) {
-  return '<strong>' + txt + '</strong>';
-}
-
-function hidden() {
-  return '<span class="hidden">?</span>';
-}
-
-function puzzleBox(ctrl: Controller) {
-  var data = ctrl.getData();
-  return h('div.side_box.metas', [
-    puzzleInfos(ctrl, data.puzzle),
-    ...gameInfos(ctrl, data.game, data.puzzle)
-  ])
-}
-
-function puzzleInfos(ctrl: Controller, puzzle): VNode {
-
-  return h('div.game_infos.puzzle', {
-    attrs: dataIcon('-')
-  }, [
-    h('div.header', [
-      h('a.title', {
-        attrs: { href: '/training/' + puzzle.id }
-      }, ctrl.trans('puzzleId', puzzle.id)),
-      h('p', {
-        hook: innerHTML(ctrl.trans('ratingX', ctrl.vm.mode === 'play' ? hidden() : strong(puzzle.rating)))
-      }),
-      h('p', {
-        hook: innerHTML(ctrl.trans('playedXTimes', strong(window.lichess.numberFormat(puzzle.attempts))))
-      })
-    ])
-  ]);
-}
-
-function gameInfos(ctrl: Controller, game, puzzle): VNode[] {
-  return [
-    h('div.game_infos.game[data-icon="-"]', {
-      attrs: dataIcon(game.perf.icon)
-    }, [
-      h('div.header', [
-        h('p', {
-          hook: innerHTML(ctrl.trans('fromGameLink', '<a href="/' + game.id + '/' + puzzle.color + '#' + puzzle.initialPly + '">#' + game.id + '</a>'))
-        }),
-        h('p', [
-          game.clock, ' • ',
-          game.perf.name, ' • ',
-          ctrl.trans.noarg(game.rated ? 'rated' : 'casual')
-        ])
-      ])
-    ]),
-    h('div.players', game.players.map(function(p) {
-      return h('div.player.color-icon.is.text.' + p.color,
-        p.userId ? h('a.user_link.ulpt', {
-          attrs: { href: '/@/' + p.userId }
-        }, p.name) : p.name
-      );
-    }))
-  ];
-}
-
-function userBox(ctrl: Controller) {
+export function puzzleBox(ctrl: Controller): VNode {
   const data = ctrl.getData();
-  if (!data.user) return;
-  let ratingHtml = data.user.rating;
-  if (ctrl.vm.round) {
-    let diff = ctrl.vm.round.ratingDiff,
-      klass = '';
-    if (diff >= 0) {
-      diff = '+' + diff;
-      if (diff > 0) klass = 'up';
-    } else if (diff === 0) diff = '+0';
-    else {
-      diff = '−' + (-diff);
-      klass = 'down';
-    }
-    ratingHtml += ' <span class="rp ' + klass + '">' + diff + '</span>';
-  }
-  const hash = ctrl.recentHash();
-  return h('div.side_box.rating', [
-    h('h2', {
-      hook: innerHTML(ctrl.trans('yourPuzzleRatingX', strong(ratingHtml)))
+  return h('div.puzzle__side__metas', [puzzleInfos(ctrl, data.puzzle), gameInfos(ctrl, data.game, data.puzzle)]);
+}
+
+function puzzleInfos(ctrl: Controller, puzzle: Puzzle): VNode {
+  return h(
+    'div.infos.puzzle',
+    {
+      attrs: dataIcon('-'),
+    },
+    [
+      h('div', [
+        ctrl.streak
+          ? null
+          : h(
+              'p',
+              ctrl.trans.vdom(
+                'puzzleId',
+                h(
+                  'a',
+                  {
+                    attrs: {
+                      href: `/training/${puzzle.id}`,
+                      ...(ctrl.streak ? { target: '_blank' } : {}),
+                    },
+                  },
+                  '#' + puzzle.id
+                )
+              )
+            ),
+        h(
+          'p',
+          ctrl.trans.vdom(
+            'ratingX',
+            !ctrl.streak && ctrl.vm.mode === 'play'
+              ? h('span.hidden', ctrl.trans.noarg('hidden'))
+              : h('strong', puzzle.rating)
+          )
+        ),
+        h('p', ctrl.trans.vdom('playedXTimes', h('strong', numberFormat(puzzle.plays)))),
+      ]),
+    ]
+  );
+}
+
+function gameInfos(ctrl: Controller, game: PuzzleGame, puzzle: Puzzle): VNode {
+  const gameName = `${game.clock} • ${game.perf.name}`;
+  return h(
+    'div.infos',
+    {
+      attrs: dataIcon(game.perf.icon),
+    },
+    [
+      h('div', [
+        h(
+          'p',
+          ctrl.trans.vdom(
+            'fromGameLink',
+            ctrl.vm.mode == 'play'
+              ? h('span', gameName)
+              : h(
+                  'a',
+                  {
+                    attrs: { href: `/${game.id}/${ctrl.vm.pov}#${puzzle.initialPly}` },
+                  },
+                  gameName
+                )
+          )
+        ),
+        h(
+          'div.players',
+          game.players.map(p =>
+            h(
+              'div.player.color-icon.is.text.' + p.color,
+              p.userId != 'anon'
+                ? h(
+                    'a.user-link.ulpt',
+                    {
+                      attrs: { href: '/@/' + p.userId },
+                    },
+                    p.title && p.title != 'BOT' ? [h('span.utitle', p.title), ' ' + p.name] : p.name
+                  )
+                : p.name
+            )
+          )
+        ),
+      ]),
+    ]
+  );
+}
+
+const renderStreak = (streak: PuzzleStreak, noarg: TransNoArg) =>
+  h(
+    'div.puzzle__side__streak',
+    streak.data.index == 0
+      ? h('div.puzzle__side__streak__info', [
+          h(
+            'h1.text',
+            {
+              attrs: dataIcon('}'),
+            },
+            'Puzzle Streak'
+          ),
+          h('p', noarg('streakDescription')),
+        ])
+      : h(
+          'div.puzzle__side__streak__score.text',
+          {
+            attrs: dataIcon('}'),
+          },
+          streak.data.index
+        )
+  );
+
+export const userBox = (ctrl: Controller): VNode => {
+  const data = ctrl.getData();
+  if (!data.user)
+    return h('div.puzzle__side__user', [
+      h('p', ctrl.trans.noarg('toGetPersonalizedPuzzles')),
+      h('a.button', { attrs: { href: '/signup' } }, ctrl.trans.noarg('signUp')),
+    ]);
+  const diff = ctrl.vm.round?.ratingDiff;
+  return h('div.puzzle__side__user', [
+    h(
+      'div.puzzle__side__user__rating',
+      ctrl.trans.vdom(
+        'yourPuzzleRatingX',
+        h('strong', [
+          data.user.rating - (diff || 0),
+          ...(diff && diff > 0 ? [' ', h('good.rp', '+' + diff)] : []),
+          ...(diff && diff < 0 ? [' ', h('bad.rp', '−' + -diff)] : []),
+        ])
+      )
+    ),
+  ]);
+};
+
+export const streakBox = (ctrl: Controller) =>
+  h('div.puzzle__side__user', renderStreak(ctrl.streak!, ctrl.trans.noarg));
+
+const difficulties: PuzzleDifficulty[] = ['easiest', 'easier', 'normal', 'harder', 'hardest'];
+
+export function replay(ctrl: Controller): MaybeVNode {
+  const replay = ctrl.getData().replay;
+  if (!replay) return;
+  const i = replay.i + (ctrl.vm.mode == 'play' ? 0 : 1);
+  return h('div.puzzle__side__replay', [
+    h(
+      'a',
+      {
+        attrs: {
+          href: `/training/dashboard/${replay.days}`,
+        },
+      },
+      ['« ', `Replaying ${ctrl.trans.noarg(ctrl.getData().theme.key)} puzzles`]
+    ),
+    h('div.puzzle__side__replay__bar', {
+      attrs: {
+        style: `--p:${replay.of ? Math.round((100 * i) / replay.of) : 1}%`,
+        'data-text': `${i} / ${replay.of}`,
+      },
     }),
-    h('div', thunk('div.rating_chart.' + hash, ratingChart, [ctrl, hash]))
   ]);
 }
 
-function ratingChart(ctrl: Controller, hash: string) {
-  return h('div.rating_chart.' + hash, {
-    hook: {
-      insert(vnode) { drawRatingChart(ctrl, vnode) },
-      postpatch(_, vnode) { drawRatingChart(ctrl, vnode) }
-    }
-  });
-}
-
-function drawRatingChart(ctrl: Controller, vnode: VNode) {
-  const dark = document.body.classList.contains('dark');
-  const points = ctrl.getData().user.recent.map(function(r) {
-    return r[2] + r[1];
-  });
-  $(vnode.elm as HTMLElement)['sparkline'](points, {
-    type: 'line',
-    width: '224px',
-    height: '80px',
-    lineColor: dark ? '#4444ff' : '#0000ff',
-    fillColor: dark ? '#222255' : '#ccccff',
-    numberFormatter: (x: number) => { return x; }
-  });
-}
-
-export default function(ctrl: Controller): VNode {
-  return h('div.puzzle_side', [
-    puzzleBox(ctrl),
-    userBox(ctrl)
+export function config(ctrl: Controller): MaybeVNode {
+  const id = 'puzzle-toggle-autonext';
+  return h('div.puzzle__side__config', [
+    h('div.puzzle__side__config__jump', [
+      h('div.switch', [
+        h(`input#${id}.cmn-toggle.cmn-toggle--subtle`, {
+          attrs: {
+            type: 'checkbox',
+            checked: ctrl.autoNext(),
+          },
+          hook: {
+            insert: vnode =>
+              (vnode.elm as HTMLElement).addEventListener('change', () => ctrl.autoNext(!ctrl.autoNext())),
+          },
+        }),
+        h('label', { attrs: { for: id } }),
+      ]),
+      h('label', { attrs: { for: id } }, ctrl.trans.noarg('jumpToNextPuzzleImmediately')),
+    ]),
+    !ctrl.getData().replay && !ctrl.streak && ctrl.difficulty
+      ? h(
+          'form.puzzle__side__config__difficulty',
+          {
+            attrs: {
+              action: `/training/difficulty/${ctrl.getData().theme.key}`,
+              method: 'post',
+            },
+          },
+          [
+            h(
+              'label',
+              {
+                attrs: { for: 'puzzle-difficulty' },
+              },
+              ctrl.trans.noarg('difficultyLevel')
+            ),
+            h(
+              'select#puzzle-difficulty.puzzle__difficulty__selector',
+              {
+                attrs: { name: 'difficulty' },
+                hook: onInsert(elm =>
+                  elm.addEventListener('change', () => (elm.parentNode as HTMLFormElement).submit())
+                ),
+              },
+              difficulties.map(diff =>
+                h(
+                  'option',
+                  {
+                    attrs: {
+                      value: diff,
+                      selected: diff == ctrl.difficulty,
+                    },
+                  },
+                  ctrl.trans.noarg(diff)
+                )
+              )
+            ),
+          ]
+        )
+      : null,
+    h(
+      'a.puzzle__side__config__zen',
+      {
+        hook: bind('click', () => lichess.pubsub.emit('zen')),
+        attrs: {
+          title: 'Keyboard: z',
+        },
+      },
+      ctrl.trans.noarg('zenMode')
+    ),
   ]);
 }

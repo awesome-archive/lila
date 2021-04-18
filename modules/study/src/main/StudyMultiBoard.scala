@@ -1,91 +1,123 @@
 package lila.study
 
-import play.api.libs.json._
-import reactivemongo.api.ReadPreference
-import reactivemongo.bson._
-
-import chess.Color
-import chess.format.pgn.{ Tag, Tags }
-import chess.format.{ FEN, Uci }
-
 import BSONHandlers._
+import chess.Color
+import chess.format.pgn.Tags
+import chess.format.{ FEN, Uci }
+import com.github.blemale.scaffeine.AsyncLoadingCache
 import JsonView._
-import lila.common.MaxPerPage
+import play.api.libs.json._
+import reactivemongo.api.bson._
+import scala.concurrent.duration._
+
+import lila.common.config.MaxPerPage
+import lila.common.paginator.AdapterLike
 import lila.common.paginator.{ Paginator, PaginatorJson }
 import lila.db.dsl._
-import lila.db.paginator.{ Adapter, MapReduceAdapter }
-import lila.game.BSONHandlers.FENBSONHandler
 
 final class StudyMultiBoard(
-    runCommand: lila.db.RunCommand,
-    chapterColl: Coll,
-    maxPerPage: MaxPerPage
-) {
+    chapterRepo: ChapterRepo,
+    cacheApi: lila.memo.CacheApi
+)(implicit ec: scala.concurrent.ExecutionContext) {
+
+  private val maxPerPage = MaxPerPage(9)
 
   import StudyMultiBoard._
+  import handlers._
 
-  def json(study: Study, page: Int, playing: Boolean): Fu[JsObject] = get(study, page, playing) map { p =>
-    PaginatorJson(p)
-  }
+  def json(studyId: Study.Id, page: Int, playing: Boolean): Fu[JsObject] = {
+    if (page == 1 && !playing) firstPageCache.get(studyId)
+    else fetch(studyId, page, playing)
+  } map { PaginatorJson(_) }
 
-  private def get(study: Study, page: Int, playing: Boolean): Fu[Paginator[ChapterPreview]] = {
-
-    val selector = $doc("studyId" -> study.id) ++ playing.??(playingSelector)
-
-    /* If players are found in the tags,
-     * return the last mainline node.
-     * Else, return the root node without its children.
-     */
-    Paginator(
-      adapter = new MapReduceAdapter[ChapterPreview](
-        collection = chapterColl,
-        selector = selector,
-        sort = $sort asc "order",
-        runCommand = runCommand,
-        command = $doc(
-          "map" -> """var node = this.root, child, tagPrefixes = ['White','Black','Result'], result = {name:this.name,orientation:this.setup.orientation,tags:this.tags.filter(t => tagPrefixes.find(p => t.indexOf(p) === 0))};
-if (result.tags.length > 1) { while(child = node.n[0]) { node = child }; }
-result.fen = node.f;
-result.uci = node.u;
-emit(this._id, result)""",
-          "reduce" -> """function() {}""",
-          "jsMode" -> true
-        )
-      ),
-      currentPage = page,
-      maxPerPage = maxPerPage
-    )
-  }
+  private val firstPageCache: AsyncLoadingCache[Study.Id, Paginator[ChapterPreview]] =
+    cacheApi.scaffeine
+      .refreshAfterWrite(4 seconds)
+      .expireAfterAccess(10 minutes)
+      .buildAsyncFuture[Study.Id, Paginator[ChapterPreview]] { fetch(_, 1, playing = false) }
 
   private val playingSelector = $doc("tags" -> "Result:*")
 
-  private implicit val previewBSONReader = new BSONDocumentReader[ChapterPreview] {
-    def read(result: BSONDocument) = {
-      val doc = result.getAs[List[Bdoc]]("value").flatMap(_.headOption) err "No mapReduce value?!"
-      val tags = doc.getAs[Tags]("tags")
-      ChapterPreview(
-        id = result.getAs[Chapter.Id]("_id") err "Preview missing id",
-        name = doc.getAs[Chapter.Name]("name") err "Preview missing name",
-        players = tags flatMap ChapterPreview.players,
-        orientation = doc.getAs[Color]("orientation") getOrElse Color.White,
-        fen = doc.getAs[FEN]("fen") err "Preview missing FEN",
-        lastMove = doc.getAs[Uci]("uci"),
-        playing = tags.flatMap(_(_.Result)) has "*"
-      )
+  private def fetch(studyId: Study.Id, page: Int, playing: Boolean): Fu[Paginator[ChapterPreview]] =
+    Paginator[ChapterPreview](
+      new ChapterPreviewAdapter(studyId, playing),
+      currentPage = page,
+      maxPerPage = maxPerPage
+    )
+
+  final private class ChapterPreviewAdapter(studyId: Study.Id, playing: Boolean)
+      extends AdapterLike[ChapterPreview] {
+
+    private val selector = $doc("studyId" -> studyId) ++ playing.??(playingSelector)
+
+    def nbResults: Fu[Int] = chapterRepo.coll(_.countSel(selector))
+
+    def slice(offset: Int, length: Int): Fu[Seq[ChapterPreview]] =
+      chapterRepo
+        .coll {
+          _.aggregateList(length, readPreference = readPref) { framework =>
+            import framework._
+            Match(selector) -> List(
+              Sort(Ascending("order")),
+              Skip(offset),
+              Limit(length),
+              Project(
+                $doc(
+                  "comp" -> $doc(
+                    "$function" -> $doc(
+                      "lang" -> "js",
+                      "args" -> $arr("$root", "$tags"),
+                      "body" -> """function(root, tags) {
+                    |tags = tags.filter(t => t.startsWith('White') || t.startsWith('Black') || t.startsWith('Result'));
+                    |const node = tags.length ? Object.keys(root).reduce((acc, i) => (root[i].p > acc.p) ? root[i] : acc, root['_']) : root['_'];
+                    |return {node:{fen:node.f,uci:node.u},tags} }""".stripMargin
+                    )
+                  ),
+                  "orientation" -> "$setup.orientation",
+                  "name"        -> true
+                )
+              )
+            )
+          }
+        }
+        .map { r =>
+          for {
+            doc  <- r
+            id   <- doc.getAsOpt[Chapter.Id]("_id")
+            name <- doc.getAsOpt[Chapter.Name]("name")
+            comp <- doc.getAsOpt[Bdoc]("comp")
+            node <- comp.getAsOpt[Bdoc]("node")
+            fen  <- node.getAsOpt[FEN]("fen")
+            lastMove = node.getAsOpt[Uci]("uci")
+            tags     = comp.getAsOpt[Tags]("tags")
+          } yield ChapterPreview(
+            id = id,
+            name = name,
+            players = tags flatMap ChapterPreview.players,
+            orientation = doc.getAsOpt[Color]("orientation") | Color.White,
+            fen = fen,
+            lastMove = lastMove,
+            playing = lastMove.isDefined && tags.flatMap(_(_.Result)).has("*")
+          )
+        }
+  }
+
+  private object handlers {
+
+    implicit val previewPlayerWriter: Writes[ChapterPreview.Player] = Writes[ChapterPreview.Player] { p =>
+      Json
+        .obj("name" -> p.name)
+        .add("title" -> p.title)
+        .add("rating" -> p.rating)
     }
-  }
 
-  private implicit val previewPlayerWriter: Writes[ChapterPreview.Player] = Writes[ChapterPreview.Player] { p =>
-    Json.obj("name" -> p.name)
-      .add("title" -> p.title)
-      .add("rating" -> p.rating)
-  }
+    implicit val previewPlayersWriter: Writes[ChapterPreview.Players] = Writes[ChapterPreview.Players] {
+      players =>
+        Json.obj("white" -> players.white, "black" -> players.black)
+    }
 
-  private implicit val previewPlayersWriter: Writes[ChapterPreview.Players] = Writes[ChapterPreview.Players] { players =>
-    Json.obj("white" -> players.white, "black" -> players.black)
+    implicit val previewWriter: Writes[ChapterPreview] = Json.writes[ChapterPreview]
   }
-
-  private implicit val previewWriter: Writes[ChapterPreview] = Json.writes[ChapterPreview]
 }
 
 object StudyMultiBoard {
@@ -106,12 +138,13 @@ object StudyMultiBoard {
 
     type Players = Color.Map[Player]
 
-    def players(tags: Tags): Option[Players] = for {
-      wName <- tags(_.White)
-      bName <- tags(_.Black)
-    } yield Color.Map(
-      white = Player(wName, tags(_.WhiteTitle), tags(_.WhiteElo) flatMap parseIntOption),
-      black = Player(bName, tags(_.BlackTitle), tags(_.BlackElo) flatMap parseIntOption)
-    )
+    def players(tags: Tags): Option[Players] =
+      for {
+        wName <- tags(_.White)
+        bName <- tags(_.Black)
+      } yield Color.Map(
+        white = Player(wName, tags(_.WhiteTitle), tags(_.WhiteElo) flatMap (_.toIntOption)),
+        black = Player(bName, tags(_.BlackTitle), tags(_.BlackElo) flatMap (_.toIntOption))
+      )
   }
 }

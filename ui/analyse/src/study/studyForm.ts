@@ -1,10 +1,9 @@
-import { h } from 'snabbdom'
-import { VNode } from 'snabbdom/vnode'
-import * as dialog from './dialog';
+import { h, VNode } from 'snabbdom';
+import * as modal from '../modal';
 import { prop, Prop } from 'common';
-import { bind, bindSubmit } from '../util';
+import { bind, bindSubmit, emptyRedButton } from '../util';
 import { StudyData } from './interfaces';
-import { MaybeVNodes } from '../interfaces';
+import { Redraw, MaybeVNodes } from '../interfaces';
 import RelayCtrl from './relay/relayCtrl';
 
 export interface StudyFormCtrl {
@@ -13,7 +12,8 @@ export interface StudyFormCtrl {
   save(data: FormData, isNew: boolean): void;
   getData(): StudyData;
   isNew(): boolean;
-  redraw(): void;
+  trans: Trans;
+  redraw: Redraw;
   relay?: RelayCtrl;
 }
 
@@ -29,38 +29,40 @@ interface Select {
 }
 type Choice = [string, string];
 
-const visibilityChoices: Choice[] = [
-  ['public', 'Public'],
-  ['unlisted', 'Unlisted'],
-  ['private', 'Invite only']
-];
-const userSelectionChoices: Choice[] = [
-  ['nobody', 'Nobody'],
-  ['owner', 'Only me'],
-  ['contributor', 'Contributors'],
-  ['member', 'Members'],
-  ['everyone', 'Everyone']
-];
-
 function select(s: Select): MaybeVNodes {
   return [
-    h('select#study-' + s.key, s.choices.map(function(o) {
-      return h('option', {
-        attrs: {
-          value: o[0],
-          selected: s.selected === o[0]
-        }
-      }, o[1]);
-    })),
-    h('label.control-label', {
-      attrs: { for: 'study-' + s.key }
-    }, s.name),
-    h('i.bar')
+    h(
+      'label.form-label',
+      {
+        attrs: { for: 'study-' + s.key },
+      },
+      s.name
+    ),
+    h(
+      `select#study-${s.key}.form-control`,
+      s.choices.map(function (o) {
+        return h(
+          'option',
+          {
+            attrs: {
+              value: o[0],
+              selected: s.selected === o[0],
+            },
+          },
+          o[1]
+        );
+      })
+    ),
   ];
-};
+}
 
-export function ctrl(save: (data: FormData, isNew: boolean) => void, getData: () => StudyData, redraw: () => void, relay?: RelayCtrl): StudyFormCtrl {
-
+export function ctrl(
+  save: (data: FormData, isNew: boolean) => void,
+  getData: () => StudyData,
+  trans: Trans,
+  redraw: Redraw,
+  relay?: RelayCtrl
+): StudyFormCtrl {
   const initAt = Date.now();
 
   function isNew(): boolean {
@@ -81,121 +83,193 @@ export function ctrl(save: (data: FormData, isNew: boolean) => void, getData: ()
     },
     getData,
     isNew,
+    trans,
     redraw,
-    relay
+    relay,
   };
 }
 
 export function view(ctrl: StudyFormCtrl): VNode {
   const data = ctrl.getData();
   const isNew = ctrl.isNew();
-  const updateName = function(vnode, isUpdate) {
+  const updateName = function (vnode: VNode, isUpdate: boolean) {
     const el = vnode.elm as HTMLInputElement;
     if (!isUpdate && !el.value) {
       el.value = data.name;
       if (isNew) el.select();
       el.focus();
     }
-  }
-  return dialog.form({
+  };
+  const userSelectionChoices: Choice[] = [
+    ['nobody', ctrl.trans.noarg('nobody')],
+    ['owner', ctrl.trans.noarg('onlyMe')],
+    ['contributor', ctrl.trans.noarg('contributors')],
+    ['member', ctrl.trans.noarg('members')],
+    ['everyone', ctrl.trans.noarg('everyone')],
+  ];
+  return modal.modal({
     class: 'study-edit',
-    onClose: function() {
+    onClose() {
       ctrl.open(false);
       ctrl.redraw();
     },
     content: [
-      h('h2', ctrl.relay ? 'Configure live broadcast' : (isNew ? 'Create' : 'Edit') + ' study'),
-      h('form.material.form.align-left', {
-        hook: bindSubmit(e => {
-          const obj: FormData = {};
-          'name visibility computer explorer cloneable chat sticky'.split(' ').forEach(n => {
-            const el = ((e.target as HTMLElement).querySelector('#study-' + n) as HTMLInputElement);
-            if (el) obj[n] = el.value;
-          });
-          ctrl.save(obj, isNew);
-        }, ctrl.redraw)
-      }, [
-        h('div.form-group' + (ctrl.relay ? '.none' : ''), [
-          h('input#study-name', {
-            attrs: {
-              minlength: 3,
-              maxlength: 100
-            },
-            hook: {
-              insert: vnode => updateName(vnode, false),
-              postpatch: (_, vnode) => updateName(vnode, true)
-            }
-          }),
-          h('label.control-label', { attrs: { 'for': 'study-name' } }, 'Name'),
-          h('i.bar')
-        ]),
-        h('div', [
-          h('div.form-group.half', select({
-            key: 'visibility',
-            name: 'Visibility',
-            choices: visibilityChoices,
-            selected: data.visibility
-          })),
-          h('div.form-group.half', select({
-            key: 'cloneable',
-            name: 'Allow cloning',
-            choices: userSelectionChoices,
-            selected: data.settings.cloneable
-          })),
-          h('div.form-group.half', select({
-            key: 'computer',
-            name: 'Computer analysis',
-            choices: userSelectionChoices,
-            selected: data.settings.computer
-          })),
-          h('div.form-group.half', select({
-            key: 'explorer',
-            name: 'Opening explorer',
-            choices: userSelectionChoices,
-            selected: data.settings.explorer
-          })),
-          h('div.form-group.half', select({
-            key: 'chat',
-            name: 'Chat',
-            choices: userSelectionChoices,
-            selected: data.settings.chat
-          })),
-          h('div.form-group.half', select({
-            key: 'sticky',
-            name: 'Enable sync',
-            choices: [
-              ['true', 'Yes: keep everyone on the same position'],
-              ['false', 'No: let people browse freely']
-            ],
-            selected: '' + data.settings.sticky
-          }))
-        ]),
-        dialog.button(isNew ? 'Start' : 'Save')
-      ]),
+      h('h2', ctrl.trans.noarg(ctrl.relay ? 'configureLiveBroadcast' : isNew ? 'createStudy' : 'editStudy')),
+      h(
+        'form.form3',
+        {
+          hook: bindSubmit(e => {
+            const obj: FormData = {};
+            'name visibility computer explorer cloneable chat sticky description'.split(' ').forEach(n => {
+              const el = (e.target as HTMLElement).querySelector('#study-' + n) as HTMLInputElement;
+              if (el) obj[n] = el.value;
+            });
+            ctrl.save(obj, isNew);
+          }, ctrl.redraw),
+        },
+        [
+          h('div.form-group' + (ctrl.relay ? '.none' : ''), [
+            h('label.form-label', { attrs: { for: 'study-name' } }, ctrl.trans.noarg('name')),
+            h('input#study-name.form-control', {
+              attrs: {
+                minlength: 3,
+                maxlength: 100,
+              },
+              hook: {
+                insert: vnode => updateName(vnode, false),
+                postpatch: (_, vnode) => updateName(vnode, true),
+              },
+            }),
+          ]),
+          h('div.form-split', [
+            h(
+              'div.form-group.form-half',
+              select({
+                key: 'visibility',
+                name: ctrl.trans.noarg('visibility'),
+                choices: [
+                  ['public', ctrl.trans.noarg('public')],
+                  ['unlisted', ctrl.trans.noarg('unlisted')],
+                  ['private', ctrl.trans.noarg('inviteOnly')],
+                ],
+                selected: data.visibility,
+              })
+            ),
+            h(
+              'div.form-group.form-half',
+              select({
+                key: 'cloneable',
+                name: ctrl.trans.noarg('allowCloning'),
+                choices: userSelectionChoices,
+                selected: data.settings.cloneable,
+              })
+            ),
+          ]),
+          h('div.form-split', [
+            h(
+              'div.form-group.form-half',
+              select({
+                key: 'computer',
+                name: ctrl.trans.noarg('computerAnalysis'),
+                choices: userSelectionChoices.map(c => [c[0], ctrl.trans.noarg(c[1])]),
+                selected: data.settings.computer,
+              })
+            ),
+            h(
+              'div.form-group.form-half',
+              select({
+                key: 'explorer',
+                name: ctrl.trans.noarg('openingExplorer'),
+                choices: userSelectionChoices,
+                selected: data.settings.explorer,
+              })
+            ),
+          ]),
+          h('div.form-split', [
+            h(
+              'div.form-group.form-half',
+              select({
+                key: 'chat',
+                name: ctrl.trans.noarg('chat'),
+                choices: userSelectionChoices,
+                selected: data.settings.chat,
+              })
+            ),
+            h(
+              'div.form-group.form-half',
+              select({
+                key: 'sticky',
+                name: ctrl.trans.noarg('enableSync'),
+                choices: [
+                  ['true', ctrl.trans.noarg('yesKeepEveryoneOnTheSamePosition')],
+                  ['false', ctrl.trans.noarg('noLetPeopleBrowseFreely')],
+                ],
+                selected: '' + data.settings.sticky,
+              })
+            ),
+          ]),
+          h(
+            'div.form-group.form-half',
+            select({
+              key: 'description',
+              name: ctrl.trans.noarg('pinnedStudyComment'),
+              choices: [
+                ['false', ctrl.trans.noarg('noPinnedComment')],
+                ['true', ctrl.trans.noarg('rightUnderTheBoard')],
+              ],
+              selected: '' + data.settings.description,
+            })
+          ),
+          h(`div.form-actions${ctrl.relay ? '' : '.single'}`, [
+            ctrl.relay
+              ? h(
+                  'a',
+                  {
+                    attrs: { href: `/broadcast/-/${data.id}/edit` },
+                  },
+                  'Broadcast settings'
+                )
+              : null,
+            h(
+              'button.button',
+              {
+                attrs: { type: 'submit' },
+              },
+              ctrl.trans.noarg(isNew ? 'start' : 'save')
+            ),
+          ]),
+        ]
+      ),
       h('div.destructive', [
-        isNew ? null : h('form', {
-          attrs: {
-            action: '/study/' + data.id + '/clear-chat',
-            method: 'post'
+        isNew
+          ? null
+          : h(
+              'form',
+              {
+                attrs: {
+                  action: '/study/' + data.id + '/clear-chat',
+                  method: 'post',
+                },
+                hook: bind('submit', _ => {
+                  return confirm(ctrl.trans.noarg('deleteTheStudyChatHistory'));
+                }),
+              },
+              [h(emptyRedButton, ctrl.trans.noarg('clearChat'))]
+            ),
+        h(
+          'form',
+          {
+            attrs: {
+              action: '/study/' + data.id + '/delete',
+              method: 'post',
+            },
+            hook: bind('submit', _ => {
+              return isNew || confirm(ctrl.trans.noarg('deleteTheEntireStudy'));
+            }),
           },
-          hook: bind('submit', _ => {
-            return confirm('Delete the study chat history? There is no going back!');
-          })
-        }, [
-          h('button.button.frameless', 'Clear chat')
-        ]),
-        h('form', {
-          attrs: {
-            action: '/study/' + data.id + '/delete',
-            method: 'post'
-          },
-          hook: bind('submit', _ => {
-            return isNew || confirm('Delete the entire study? There is no going back!');
-          })
-        }, [
-          h('button.button.frameless', isNew ? 'Cancel' : 'Delete study')
-        ])
-      ])
-    ]
+          [h(emptyRedButton, ctrl.trans.noarg(isNew ? 'cancel' : 'deleteStudy'))]
+        ),
+      ]),
+    ],
   });
 }

@@ -1,26 +1,37 @@
 package lila.tv
 
-import scala.concurrent.duration._
-
 import lila.common.LightUser
-import lila.game.{ Game, Pov }
+import lila.game.{ Game, GameRepo, Pov }
 import lila.hub.Trouper
 
-final class Tv(trouper: Trouper, roundProxyGame: Game.ID => Fu[Option[Game]]) {
+final class Tv(
+    gameRepo: GameRepo,
+    trouper: Trouper,
+    gameProxyRepo: lila.round.GameProxyRepo
+)(implicit ec: scala.concurrent.ExecutionContext) {
 
   import Tv._
   import ChannelTrouper._
+
+  private def roundProxyGame = gameProxyRepo.game _
 
   def getGame(channel: Tv.Channel): Fu[Option[Game]] =
     trouper.ask[Option[Game.ID]](TvTrouper.GetGameId(channel, _)) flatMap { _ ?? roundProxyGame }
 
   def getGameAndHistory(channel: Tv.Channel): Fu[Option[(Game, List[Pov])]] =
     trouper.ask[GameIdAndHistory](TvTrouper.GetGameIdAndHistory(channel, _)) flatMap {
-      case GameIdAndHistory(gameId, historyIds) => for {
-        game <- gameId ?? roundProxyGame
-        games <- historyIds.map(roundProxyGame).sequenceFu.map(_.flatten)
-        history = games map Pov.first
-      } yield game map (_ -> history)
+      case GameIdAndHistory(gameId, historyIds) =>
+        for {
+          game <- gameId ?? roundProxyGame
+          games <-
+            historyIds
+              .map { id =>
+                roundProxyGame(id) orElse gameRepo.game(id)
+              }
+              .sequenceFu
+              .dmap(_.flatten)
+          history = games map Pov.naturalOrientation
+        } yield game map (_ -> history)
     }
 
   def getGames(channel: Tv.Channel, max: Int): Fu[List[Game]] =
@@ -28,7 +39,7 @@ final class Tv(trouper: Trouper, roundProxyGame: Game.ID => Fu[Option[Game]]) {
       _.map(roundProxyGame).sequenceFu.map(_.flatten)
     }
 
-  def getBestGame = getGame(Tv.Channel.Best)
+  def getBestGame = getGame(Tv.Channel.Best) orElse gameRepo.random
 
   def getBestAndHistory = getGameAndHistory(Tv.Channel.Best)
 
@@ -46,119 +57,186 @@ object Tv {
   }
 
   private[tv] case class Candidate(game: Game, hasBot: Boolean)
-  private[tv] def toCandidate(lightUser: LightUser.GetterSync)(game: Game) = Tv.Candidate(
-    game = game,
-    hasBot = game.userIds.exists { userId =>
-      lightUser(userId).exists(_.isBot)
-    }
-  )
+  private[tv] def toCandidate(lightUser: LightUser.GetterSync)(game: Game) =
+    Tv.Candidate(
+      game = game,
+      hasBot = game.userIds.exists { userId =>
+        lightUser(userId).exists(_.isBot)
+      }
+    )
 
-  sealed abstract class Channel(val name: String, val icon: String, filters: Seq[Candidate => Boolean]) {
-    def filter(c: Candidate) = filters forall { _(c) }
-    val key = toString.head.toLower + toString.drop(1)
+  sealed abstract class Channel(
+      val name: String,
+      val icon: String,
+      val secondsSinceLastMove: Int,
+      filters: Seq[Candidate => Boolean]
+  ) {
+    def isFresh(g: Game): Boolean     = fresh(secondsSinceLastMove, g)
+    def filter(c: Candidate): Boolean = filters.forall { _(c) } && isFresh(c.game)
+    val key                           = s"${toString.head.toLower}${toString.drop(1)}"
   }
   object Channel {
-    case object Best extends Channel(
-      name = "Top Rated",
-      icon = "C",
-      filters = Seq(rated, standard, freshBlitz, noBot)
-    )
-    case object Bullet extends Channel(
-      name = S.Bullet.name,
-      icon = P.Bullet.iconChar.toString,
-      filters = Seq(rated, standard, speed(S.Bullet), fresh(40), noBot)
-    )
-    case object Blitz extends Channel(
-      name = S.Blitz.name,
-      icon = P.Blitz.iconChar.toString,
-      filters = Seq(rated, standard, speed(S.Blitz), freshBlitz, noBot)
-    )
-    case object Rapid extends Channel(
-      name = S.Rapid.name,
-      icon = P.Rapid.iconChar.toString,
-      filters = Seq(rated, standard, speed(S.Rapid), fresh(60 * 5), noBot)
-    )
-    case object Classical extends Channel(
-      name = S.Classical.name,
-      icon = P.Classical.iconChar.toString,
-      filters = Seq(rated, standard, speed(S.Classical), fresh(60 * 8), noBot)
-    )
-    case object Chess960 extends Channel(
-      name = V.Chess960.name,
-      icon = P.Chess960.iconChar.toString,
-      filters = Seq(variant(V.Chess960), freshBlitz, noBot)
-    )
-    case object KingOfTheHill extends Channel(
-      name = V.KingOfTheHill.name,
-      icon = P.KingOfTheHill.iconChar.toString,
-      filters = Seq(variant(V.KingOfTheHill), freshBlitz, noBot)
-    )
-    case object ThreeCheck extends Channel(
-      name = V.ThreeCheck.name,
-      icon = P.ThreeCheck.iconChar.toString,
-      filters = Seq(variant(V.ThreeCheck), freshBlitz, noBot)
-    )
-    case object Antichess extends Channel(
-      name = V.Antichess.name,
-      icon = P.Antichess.iconChar.toString,
-      filters = Seq(variant(V.Antichess), freshBlitz, noBot)
-    )
-    case object Atomic extends Channel(
-      name = V.Atomic.name,
-      icon = P.Atomic.iconChar.toString,
-      filters = Seq(variant(V.Atomic), freshBlitz, noBot)
-    )
-    case object Horde extends Channel(
-      name = V.Horde.name,
-      icon = P.Horde.iconChar.toString,
-      filters = Seq(variant(V.Horde), freshBlitz, noBot)
-    )
-    case object RacingKings extends Channel(
-      name = V.RacingKings.name,
-      icon = P.RacingKings.iconChar.toString,
-      filters = Seq(variant(V.RacingKings), freshBlitz, noBot)
-    )
-    case object Crazyhouse extends Channel(
-      name = V.Crazyhouse.name,
-      icon = P.Crazyhouse.iconChar.toString,
-      filters = Seq(variant(V.Crazyhouse), freshBlitz, noBot)
-    )
-    case object UltraBullet extends Channel(
-      name = S.UltraBullet.name,
-      icon = P.UltraBullet.iconChar.toString,
-      filters = Seq(rated, standard, speed(S.UltraBullet), fresh(20), noBot)
-    )
-    case object Bot extends Channel(
-      name = "Bot",
-      icon = "n",
-      filters = Seq(standard, freshBlitz, hasBot)
-    )
-    case object Computer extends Channel(
-      name = "Computer",
-      icon = "n",
-      filters = Seq(computerFromInitialPosition, freshBlitz)
-    )
+    case object Best
+        extends Channel(
+          name = "Top Rated",
+          icon = "C",
+          secondsSinceLastMove = freshBlitz,
+          filters = Seq(rated(2150), standard, noBot)
+        )
+    case object Bullet
+        extends Channel(
+          name = S.Bullet.name,
+          icon = P.Bullet.iconChar.toString,
+          secondsSinceLastMove = 35,
+          filters = Seq(speed(S.Bullet), rated(2000), standard, noBot)
+        )
+    case object Blitz
+        extends Channel(
+          name = S.Blitz.name,
+          icon = P.Blitz.iconChar.toString,
+          secondsSinceLastMove = freshBlitz,
+          filters = Seq(speed(S.Blitz), rated(2000), standard, noBot)
+        )
+    case object Rapid
+        extends Channel(
+          name = S.Rapid.name,
+          icon = P.Rapid.iconChar.toString,
+          secondsSinceLastMove = 60 * 5,
+          filters = Seq(speed(S.Rapid), rated(1800), standard, noBot)
+        )
+    case object Classical
+        extends Channel(
+          name = S.Classical.name,
+          icon = P.Classical.iconChar.toString,
+          secondsSinceLastMove = 60 * 8,
+          filters = Seq(speed(S.Classical), rated(1650), standard, noBot)
+        )
+    case object Chess960
+        extends Channel(
+          name = V.Chess960.name,
+          icon = P.Chess960.iconChar.toString,
+          secondsSinceLastMove = freshBlitz,
+          filters = Seq(variant(V.Chess960), noBot)
+        )
+    case object KingOfTheHill
+        extends Channel(
+          name = V.KingOfTheHill.name,
+          icon = P.KingOfTheHill.iconChar.toString,
+          secondsSinceLastMove = freshBlitz,
+          filters = Seq(variant(V.KingOfTheHill), noBot)
+        )
+    case object ThreeCheck
+        extends Channel(
+          name = V.ThreeCheck.name,
+          icon = P.ThreeCheck.iconChar.toString,
+          secondsSinceLastMove = freshBlitz,
+          filters = Seq(variant(V.ThreeCheck), noBot)
+        )
+    case object Antichess
+        extends Channel(
+          name = V.Antichess.name,
+          icon = P.Antichess.iconChar.toString,
+          secondsSinceLastMove = freshBlitz,
+          filters = Seq(variant(V.Antichess), noBot)
+        )
+    case object Atomic
+        extends Channel(
+          name = V.Atomic.name,
+          icon = P.Atomic.iconChar.toString,
+          secondsSinceLastMove = freshBlitz,
+          filters = Seq(variant(V.Atomic), noBot)
+        )
+    case object Horde
+        extends Channel(
+          name = V.Horde.name,
+          icon = P.Horde.iconChar.toString,
+          secondsSinceLastMove = freshBlitz,
+          filters = Seq(variant(V.Horde), noBot)
+        )
+    case object RacingKings
+        extends Channel(
+          name = V.RacingKings.name,
+          icon = P.RacingKings.iconChar.toString,
+          secondsSinceLastMove = freshBlitz,
+          filters = Seq(variant(V.RacingKings), noBot)
+        )
+    case object Crazyhouse
+        extends Channel(
+          name = V.Crazyhouse.name,
+          icon = P.Crazyhouse.iconChar.toString,
+          secondsSinceLastMove = freshBlitz,
+          filters = Seq(variant(V.Crazyhouse), noBot)
+        )
+    case object UltraBullet
+        extends Channel(
+          name = S.UltraBullet.name,
+          icon = P.UltraBullet.iconChar.toString,
+          secondsSinceLastMove = 20,
+          filters = Seq(speed(S.UltraBullet), rated(1600), standard, noBot)
+        )
+    case object Bot
+        extends Channel(
+          name = "Bot",
+          icon = "n",
+          secondsSinceLastMove = freshBlitz,
+          filters = Seq(standard, hasBot)
+        )
+    case object Computer
+        extends Channel(
+          name = "Computer",
+          icon = "n",
+          secondsSinceLastMove = freshBlitz,
+          filters = Seq(computerFromInitialPosition)
+        )
     val all = List(
       Best,
-      Bullet, Blitz, Rapid, Classical,
-      Crazyhouse, Chess960, KingOfTheHill, ThreeCheck, Antichess, Atomic, Horde, RacingKings,
+      Bullet,
+      Blitz,
+      Rapid,
+      Classical,
+      Crazyhouse,
+      Chess960,
+      KingOfTheHill,
+      ThreeCheck,
+      Antichess,
+      Atomic,
+      Horde,
+      RacingKings,
       UltraBullet,
-      Bot, Computer
+      Bot,
+      Computer
     )
-    val byKey = all.map { c => c.key -> c }.toMap
+    val byKey = all.map { c =>
+      c.key -> c
+    }.toMap
   }
 
-  private def rated = (c: Candidate) => c.game.rated
-  private def speed(speed: chess.Speed) = (c: Candidate) => c.game.speed == speed
-  private def variant(variant: chess.variant.Variant) = (c: Candidate) => c.game.variant == variant
-  private val standard = variant(V.Standard)
-  private def fresh(seconds: Int) = (c: Candidate) => {
-    c.game.isBeingPlayed && !c.game.olderThan(seconds)
-  } || {
-    c.game.finished && !c.game.olderThan(7)
-  } // rematch time
-  private val freshBlitz = fresh(60 * 2)
+  private def rated(min: Int)                           = (c: Candidate) => c.game.rated && hasMinRating(c.game, min)
+  private def speed(speed: chess.Speed)                 = (c: Candidate) => c.game.speed == speed
+  private def variant(variant: chess.variant.Variant)   = (c: Candidate) => c.game.variant == variant
+  private val standard                                  = variant(V.Standard)
+  private val freshBlitz                                = 60 * 2
   private def computerFromInitialPosition(c: Candidate) = c.game.hasAi && !c.game.fromPosition
-  private def hasBot(c: Candidate) = c.hasBot
-  private def noBot(c: Candidate) = !c.hasBot
+  private def hasBot(c: Candidate)                      = c.hasBot
+  private def noBot(c: Candidate)                       = !c.hasBot
+
+  private def fresh(seconds: Int, game: Game): Boolean = {
+    game.isBeingPlayed && !game.olderThan(seconds)
+  } || {
+    game.finished && !game.olderThan(7)
+  } // rematch time
+  private def hasMinRating(g: Game, min: Int) = g.players.exists(_.rating.exists(_ >= min))
+
+  private[tv] val titleScores = Map(
+    "GM"  -> 500,
+    "WGM" -> 500,
+    "IM"  -> 300,
+    "WIM" -> 300,
+    "FM"  -> 200,
+    "WFM" -> 200,
+    "NM"  -> 100,
+    "CM"  -> 100,
+    "WCM" -> 100,
+    "WNM" -> 100
+  )
 }

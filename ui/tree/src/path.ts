@@ -21,12 +21,12 @@ export function last(path: Tree.Path): string {
 }
 
 export function contains(p1: Tree.Path, p2: Tree.Path): boolean {
-  return p1.indexOf(p2) === 0;
+  return p1.startsWith(p2);
 }
 
 export function fromNodeList(nodes: Tree.Node[]): Tree.Path {
-  var path = '';
-  for (var i in nodes) path += nodes[i].id;
+  let path = '';
+  for (const i in nodes) path += nodes[i].id;
   return path;
 }
 
